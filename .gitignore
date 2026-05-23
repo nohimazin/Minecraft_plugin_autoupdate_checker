@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.minecraft_plugin_autoupdate_checker/
+plugin-manager.sqlite
