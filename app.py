@@ -1127,9 +1127,6 @@ class IconManager:
                         icon_url = res.get("image") or res.get("avatar") or res.get("iconUrl") or res.get("imageUrl") or None
                         icon_data = ""
 
-                    if icon_url:
-                        icon_url = urllib.parse.urljoin("https://api.spiget.org/", str(icon_url))
-
                     if not icon_url and icon_data:
                         try:
                             raw_bytes = base64.b64decode(icon_data)
@@ -1140,6 +1137,27 @@ class IconManager:
                             return
                         except Exception:
                             icon_url = None
+                    if icon_url:
+                        icon_url = urllib.parse.urljoin("https://api.spiget.org/", str(icon_url))
+                        # Spiget's icon URL often ends in .jpg while the payload is actually PNG.
+                        # Keep the fetched bytes, but normalize the cache extension to .png when the
+                        # response is PNG-like so non-Pillow environments can load it.
+                        parsed_icon_path = urllib.parse.urlparse(icon_url).path.lower()
+                        if parsed_icon_path.endswith(".jpg") or parsed_icon_path.endswith(".jpeg"):
+                            try:
+                                req = urllib.request.Request(icon_url, headers={"User-Agent": USER_AGENT})
+                                with urllib.request.urlopen(req, timeout=20) as resp:
+                                    payload = resp.read()
+                                if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+                                    target = self.cache_dir / f"{key}.png"
+                                else:
+                                    target = self.cache_dir / f"{key}{Path(parsed_icon_path).suffix or '.jpg'}"
+                                target.write_bytes(payload)
+                                self.app._log(f"Icon downloaded for {key}: {icon_url} -> {target}")
+                                self.app.task_queue.put(("icon_updated", key))
+                                return
+                            except Exception:
+                                icon_url = None
                 except Exception:
                     icon_url = None
             if not icon_url:
