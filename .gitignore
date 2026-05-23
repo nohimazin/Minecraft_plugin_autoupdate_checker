@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .minecraft_plugin_autoupdate_checker/
 plugin-manager.sqlite
+.specstory/.project.json
+.specstory/statistics.json
+.specstory/cli/config.toml
+.specstory/history/2026-05-22_08-36-52Z-プラグイン更新確認ツール.md
+.specstory/history/2026-05-14_11-13-55Z-minecraft-mod-langファイル翻訳.md
+.gitignore
