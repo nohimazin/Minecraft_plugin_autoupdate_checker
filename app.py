@@ -43,6 +43,11 @@ GITHUB_REPO_URL = "https://api.github.com/repos/{owner}/{repo}"
 GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/{owner}/{repo}/releases/latest"
 GITHUB_RELEASES_URL = "https://api.github.com/repos/{owner}/{repo}/releases"
 GITHUB_PROJECT_PAGE_URL = "https://github.com/{owner}/{repo}"
+SPIGET_RESOURCE_URL = "https://api.spiget.org/v2/resources/{id}"
+SPIGET_VERSIONS_URL = "https://api.spiget.org/v2/resources/{id}/versions"
+SPIGET_DOWNLOAD_URL = "https://api.spiget.org/v2/resources/{id}/download?version={version_id}"
+SPIGET_PROJECT_PAGE_URL = "https://spiget.org/resource/{id}"
+SPIGITMC_PROJECT_PAGE_URL = "https://www.spigotmc.org/resources/{id}"
 SERVER_SOFTWARE_OPTIONS = ["自動", "Paper", "Spigot", "Bukkit", "Purpur"]
 SERVER_SOFTWARE_LOADERS = {
     "paper": ["paper", "spigot", "bukkit"],
@@ -635,6 +640,96 @@ def get_github_release(repo_ref: str, server_version: str = "", server_software:
     }
 
 
+def extract_spiget_resource_id(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+
+    parsed = urllib.parse.urlparse(text)
+    path = parsed.path or ""
+    # common URL patterns
+    m = re.search(r"/resources/(?:[^/]+/)?(\d+)", path)
+    if m:
+        return m.group(1)
+    m = re.search(r"/resource/(\d+)", path)
+    if m:
+        return m.group(1)
+    m = re.search(r"/v2/resources/(\d+)", path)
+    if m:
+        return m.group(1)
+
+    # try matching in plain text
+    m = re.search(r"spigotmc\.org/resources/(?:[^/]+/)?(\d+)", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"spiget\.org/resource/(\d+)", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"api\.spiget\.org/v2/resources/(\d+)", text)
+    if m:
+        return m.group(1)
+
+    # numeric id fallback
+    if re.fullmatch(r"\d+", text):
+        return text
+
+    return ""
+
+
+def get_spiget_release(resource_ref: str, server_version: str = "", server_software: str = "") -> dict | None:
+    ref = extract_spiget_resource_id(resource_ref)
+    if not ref:
+        return None
+
+    try:
+        resource = http_json(SPIGET_RESOURCE_URL.format(id=ref))
+    except Exception:
+        resource = {}
+
+    try:
+        versions = http_json(SPIGET_VERSIONS_URL.format(id=ref))
+    except Exception:
+        versions = []
+
+    if not versions:
+        # if no versions, still return basic resource info
+        title = resource.get("name") or resource.get("title") or str(ref)
+        return {
+            "project_id": ref,
+            "title": title,
+            "version": "",
+            "download_url": SPIGET_DOWNLOAD_URL.format(id=ref, version_id=""),
+            "date_published": resource.get("date") or resource.get("createdAt") or "",
+            "matched_server_version": (server_version or "").strip(),
+            "matched_server_software": normalize_server_software(server_software),
+        }
+
+    def sort_key(v: dict) -> object:
+        return v.get("releaseDate") or v.get("date") or v.get("timestamp") or v.get("id") or 0
+
+    try:
+        latest = max(versions, key=sort_key)
+    except Exception:
+        latest = versions[-1] if versions else {}
+
+    version_id = latest.get("id") or ""
+    version_name = str(latest.get("name") or latest.get("version") or version_id)
+    download_url = SPIGET_DOWNLOAD_URL.format(id=ref, version_id=version_id) if version_id else SPIGET_DOWNLOAD_URL.format(id=ref, version_id="")
+
+    title = resource.get("name") or resource.get("title") or str(ref)
+    date_published = latest.get("releaseDate") or latest.get("date") or ""
+
+    return {
+        "project_id": ref,
+        "title": title,
+        "version": version_name,
+        "download_url": download_url,
+        "date_published": date_published,
+        "matched_server_version": (server_version or "").strip(),
+        "matched_server_software": normalize_server_software(server_software),
+    }
+
+
 def allowed_modrinth_version_types(channel: str) -> set[str]:
     normalized = normalize_modrinth_version_channel(channel)
     if normalized == "alpha":
@@ -658,6 +753,8 @@ def format_source_label(source_type: str | None, source_title: str | None, sourc
         return "Hangar"
     if st == "github":
         return "GitHub"
+    if st == "spiget":
+        return "Spiget"
     if st in ("manual", "listing") or (source_id and str(source_id).startswith("listing://")):
         return "手動"
     # fallback to visible title if given
@@ -971,6 +1068,13 @@ class IconManager:
                         data = http_json(GITHUB_REPO_URL.format(owner=owner, repo=repo))
                         owner_info = data.get("owner") or {}
                         icon_url = owner_info.get("avatar_url") or data.get("avatar_url") or None
+                except Exception:
+                    icon_url = None
+            elif normalized_source_type == "spiget" and source_id:
+                try:
+                    res = http_json(SPIGET_RESOURCE_URL.format(id=source_id))
+                    # try common fields
+                    icon_url = res.get("icon") or res.get("image") or res.get("avatar") or res.get("iconUrl") or res.get("imageUrl") or None
                 except Exception:
                     icon_url = None
             if not icon_url:
@@ -1506,6 +1610,7 @@ class PluginManagerApp(Tk):
         modrinth_id = ensure_modrinth_project_id(source_value)
         hangar_ref = extract_hangar_project_ref(source_value)
         github_ref = extract_github_repo_ref(source_value)
+        spiget_ref = extract_spiget_resource_id(source_value)
 
         if "modrinth.com" in value_lower or "api.modrinth.com" in value_lower or (preferred_type == "modrinth" and modrinth_id) or (modrinth_id and "/" not in source_value):
             source_type = "modrinth"
@@ -1553,6 +1658,14 @@ class PluginManagerApp(Tk):
                 project_title = str(project_info.get("full_name") or project_info.get("name") or project_title or github_ref)
             except Exception:
                 project_title = project_title or github_ref
+        elif "spigotmc.org" in value_lower or "spiget.org" in value_lower or (preferred_type == "spiget" and spiget_ref) or (spiget_ref and re.fullmatch(r"\d+", source_value)):
+            source_type = "spiget"
+            source_id = spiget_ref
+            try:
+                res = http_json(SPIGET_RESOURCE_URL.format(id=spiget_ref))
+                project_title = str(res.get("name") or res.get("title") or project_title or spiget_ref)
+            except Exception:
+                project_title = project_title or spiget_ref
         elif modrinth_id:
             source_type = "modrinth"
             source_id = modrinth_id
@@ -1771,6 +1884,16 @@ class PluginManagerApp(Tk):
                 owner, repo = repo_ref.split("/", 1)
                 webbrowser.open(GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo))
                 return
+        if source_type == "spiget" and source_id:
+            try:
+                webbrowser.open(SPIGET_PROJECT_PAGE_URL.format(id=source_id))
+                return
+            except Exception:
+                try:
+                    webbrowser.open(SPIGITMC_PROJECT_PAGE_URL.format(id=source_id))
+                    return
+                except Exception:
+                    pass
 
         source_title = str(row_get(row, "source_title") or "").strip()
         plugin_name = str(row_get(row, "plugin_name") or "").strip()
@@ -2178,6 +2301,25 @@ class PluginManagerApp(Tk):
                 if not release:
                     raise RuntimeError(
                         f"指定条件に対応するGitHub Releaseが見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
+                    )
+            elif resolved_source_type == "spiget" and resolved_source_id:
+                resource_id = extract_spiget_resource_id(resolved_source_id)
+                if not resource_id:
+                    return {
+                        "source_type": resolved_source_type,
+                        "source_id": resolved_source_id,
+                        "source_title": resolved_title,
+                        "latest_version": latest_version,
+                        "latest_download_url": latest_download_url,
+                        "update_available": 0,
+                        "last_checked": now_iso(),
+                        "last_error": "SpigetのURLまたはresource idを解決できませんでした",
+                    }
+                resolved_source_id = resource_id
+                release = get_spiget_release(resource_id, server_version=server_version, server_software=server_software)
+                if not release:
+                    raise RuntimeError(
+                        f"指定条件に対応するSpiget版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
                     )
             else:
                 hit = search_modrinth_plugin(row["plugin_name"])
