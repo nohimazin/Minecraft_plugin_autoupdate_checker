@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 import os
@@ -47,7 +48,7 @@ SPIGET_RESOURCE_URL = "https://api.spiget.org/v2/resources/{id}"
 SPIGET_VERSIONS_URL = "https://api.spiget.org/v2/resources/{id}/versions"
 SPIGET_DOWNLOAD_URL = "https://api.spiget.org/v2/resources/{id}/download?version={version_id}"
 SPIGET_PROJECT_PAGE_URL = "https://spiget.org/resource/{id}"
-SPIGITMC_PROJECT_PAGE_URL = "https://www.spigotmc.org/resources/{id}"
+SPIGITMC_PROJECT_PAGE_URL = "https://www.spigotmc.org/resources/{id}/"
 SERVER_SOFTWARE_OPTIONS = ["自動", "Paper", "Spigot", "Bukkit", "Purpur"]
 SERVER_SOFTWARE_LOADERS = {
     "paper": ["paper", "spigot", "bukkit"],
@@ -646,32 +647,39 @@ def extract_spiget_resource_id(value: str) -> str:
         return ""
 
     parsed = urllib.parse.urlparse(text)
-    path = parsed.path or ""
-    # common URL patterns
-    m = re.search(r"/resources/(?:[^/]+/)?(\d+)", path)
-    if m:
-        return m.group(1)
-    m = re.search(r"/resource/(\d+)", path)
-    if m:
-        return m.group(1)
-    m = re.search(r"/v2/resources/(\d+)", path)
-    if m:
-        return m.group(1)
+    path = (parsed.path or "").strip("/")
 
-    # try matching in plain text
-    m = re.search(r"spigotmc\.org/resources/(?:[^/]+/)?(\d+)", text)
-    if m:
-        return m.group(1)
-    m = re.search(r"spiget\.org/resource/(\d+)", text)
-    if m:
-        return m.group(1)
-    m = re.search(r"api\.spiget\.org/v2/resources/(\d+)", text)
+    parts = [part for part in path.split("/") if part]
+    for index, part in enumerate(parts):
+        if part not in {"resources", "resource", "v2"}:
+            continue
+        if part == "v2" and index + 2 < len(parts) and parts[index + 1] == "resources":
+            candidate = parts[index + 2]
+        elif index + 1 < len(parts):
+            candidate = parts[index + 1]
+        else:
+            continue
+
+        if re.fullmatch(r"\d+", candidate):
+            return candidate
+
+        dotted = re.search(r"(?:^|\.)(\d+)$", candidate)
+        if dotted:
+            return dotted.group(1)
+
+    # try matching in plain text for copied URLs and API URLs
+    m = re.search(r"(?:spigotmc\.org/resources/|spiget\.org/resource/|api\.spiget\.org/v2/resources/)(?:[^/?#]+[./])?(\d+)", text)
     if m:
         return m.group(1)
 
     # numeric id fallback
     if re.fullmatch(r"\d+", text):
         return text
+
+    # bare SpigotMC resource refs like "geyserskinmanager.88607"
+    bare_dotted = re.search(r"(?:^|\.)(\d+)$", text)
+    if bare_dotted:
+        return bare_dotted.group(1)
 
     return ""
 
@@ -755,6 +763,8 @@ def format_source_label(source_type: str | None, source_title: str | None, sourc
         return "GitHub"
     if st == "spiget":
         return "Spiget"
+    if st == "spigot":
+        return "Spiget"
     if st in ("manual", "listing") or (source_id and str(source_id).startswith("listing://")):
         return "手動"
     # fallback to visible title if given
@@ -770,6 +780,15 @@ def format_source_label(source_type: str | None, source_title: str | None, sourc
     if source_id:
         return str(source_id)
     return "-"
+
+
+def normalize_source_type(value: str | None) -> str:
+    st = (value or "").strip().lower()
+    if st in {"spigot", "spigotmc", "spiget"}:
+        return "spiget"
+    if st in {"modrinth", "hangar", "github"}:
+        return st
+    return st
 
 
 def row_get(row, key: str, default=None):
@@ -816,6 +835,7 @@ class PluginDatabase:
         self.connection = sqlite3.connect(self.db_path)
         self.connection.row_factory = sqlite3.Row
         self._init_schema()
+        self._migrate_spiget_rows()
         self._deduplicate_listing_plugins()
 
     def _init_schema(self) -> None:
@@ -938,6 +958,32 @@ class PluginDatabase:
                     placeholders = ",".join("?" for _ in delete_ids)
                     self.connection.execute(f"DELETE FROM plugins WHERE id IN ({placeholders})", delete_ids)
 
+    def _migrate_spiget_rows(self) -> None:
+        rows = self.connection.execute(
+            """
+            SELECT id, plugin_name, source_type, source_id, source_title
+            FROM plugins
+            WHERE source_id LIKE '%spigotmc.org/%' OR source_id LIKE '%spiget.org/%' OR source_title LIKE '%spigotmc.org/%'
+            """
+        ).fetchall()
+
+        if not rows:
+            return
+
+        with self.connection:
+            for row in rows:
+                resource_id = extract_spiget_resource_id(str(row["source_id"] or row["source_title"] or ""))
+                if not resource_id:
+                    continue
+                self.connection.execute(
+                    """
+                    UPDATE plugins
+                    SET source_type = 'spiget', source_id = ?, source_title = COALESCE(NULLIF(source_title, ''), plugin_name), updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (resource_id, now_iso(), row["id"]),
+                )
+
     def list_plugins(self) -> list[sqlite3.Row]:
         return list(self.connection.execute("SELECT * FROM plugins ORDER BY plugin_name COLLATE NOCASE"))
 
@@ -1042,7 +1088,7 @@ class IconManager:
             source_type = row_get(row, "source_type")
             source_id = str(row_get(row, "source_id") or "")
             icon_url = None
-            normalized_source_type = str(source_type or "").lower()
+            normalized_source_type = normalize_source_type(source_type)
 
             if normalized_source_type == "modrinth" and source_id:
                 try:
@@ -1073,8 +1119,27 @@ class IconManager:
             elif normalized_source_type == "spiget" and source_id:
                 try:
                     res = http_json(SPIGET_RESOURCE_URL.format(id=source_id))
-                    # try common fields
-                    icon_url = res.get("icon") or res.get("image") or res.get("avatar") or res.get("iconUrl") or res.get("imageUrl") or None
+                    icon = res.get("icon") or {}
+                    if isinstance(icon, dict):
+                        icon_url = icon.get("url") or icon.get("imageUrl") or icon.get("iconUrl") or None
+                        icon_data = icon.get("data") or ""
+                    else:
+                        icon_url = res.get("image") or res.get("avatar") or res.get("iconUrl") or res.get("imageUrl") or None
+                        icon_data = ""
+
+                    if icon_url:
+                        icon_url = urllib.parse.urljoin("https://api.spiget.org/", str(icon_url))
+
+                    if not icon_url and icon_data:
+                        try:
+                            raw_bytes = base64.b64decode(icon_data)
+                            target = self.cache_dir / f"{key}.png"
+                            target.write_bytes(raw_bytes)
+                            self.app._log(f"Icon extracted from Spiget payload for {key} -> {target}")
+                            self.app.task_queue.put(("icon_updated", key))
+                            return
+                        except Exception:
+                            icon_url = None
                 except Exception:
                     icon_url = None
             if not icon_url:
@@ -1601,13 +1666,13 @@ class PluginManagerApp(Tk):
 
     def _apply_manual_match_url(self, row: sqlite3.Row, source_value: str) -> bool:
         source_value = (source_value or "").strip()
-        preferred_type = str(row_get(row, "source_type") or "").lower()
+        preferred_type = normalize_source_type(row_get(row, "source_type"))
         value_lower = source_value.lower()
         source_type = ""
         source_id = ""
         project_title = str(row_get(row, "plugin_name") or row_get(row, "source_title") or "")
 
-        modrinth_id = ensure_modrinth_project_id(source_value)
+        modrinth_id = extract_modrinth_project_id(source_value)
         hangar_ref = extract_hangar_project_ref(source_value)
         github_ref = extract_github_repo_ref(source_value)
         spiget_ref = extract_spiget_resource_id(source_value)
@@ -1666,7 +1731,7 @@ class PluginManagerApp(Tk):
                 project_title = str(res.get("name") or res.get("title") or project_title or spiget_ref)
             except Exception:
                 project_title = project_title or spiget_ref
-        elif modrinth_id:
+        elif modrinth_id and ("modrinth.com" in value_lower or "api.modrinth.com" in value_lower or "/" not in source_value):
             source_type = "modrinth"
             source_id = modrinth_id
             try:
@@ -1864,7 +1929,7 @@ class PluginManagerApp(Tk):
         self.wait_window(dialog)
 
     def _open_homepage_for_row(self, row: sqlite3.Row) -> None:
-        source_type = str(row_get(row, "source_type") or "").lower()
+        source_type = normalize_source_type(row_get(row, "source_type"))
         source_id = str(row_get(row, "source_id") or "")
         if source_id.startswith("http://") or source_id.startswith("https://"):
             webbrowser.open(source_id)
@@ -1886,11 +1951,11 @@ class PluginManagerApp(Tk):
                 return
         if source_type == "spiget" and source_id:
             try:
-                webbrowser.open(SPIGET_PROJECT_PAGE_URL.format(id=source_id))
+                webbrowser.open(SPIGITMC_PROJECT_PAGE_URL.format(id=source_id))
                 return
             except Exception:
                 try:
-                    webbrowser.open(SPIGITMC_PROJECT_PAGE_URL.format(id=source_id))
+                    webbrowser.open(SPIGET_PROJECT_PAGE_URL.format(id=source_id))
                     return
                 except Exception:
                     pass
@@ -2229,9 +2294,11 @@ class PluginManagerApp(Tk):
 
     def _resolve_entry_update(self, row: sqlite3.Row) -> dict:
         current_version = row["current_version"] or ""
-        source_type = row["source_type"] or ""
+        source_type = normalize_source_type(row["source_type"])
         source_id = row["source_id"] or ""
         source_title = row["source_title"] or ""
+        if source_type == "modrinth" and extract_spiget_resource_id(source_id) and ("spigotmc.org" in str(source_id).lower() or "spiget.org" in str(source_id).lower()):
+            source_type = "spiget"
         latest_version = ""
         latest_download_url = ""
         resolved_title = source_title
@@ -2322,41 +2389,55 @@ class PluginManagerApp(Tk):
                         f"指定条件に対応するSpiget版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
                     )
             else:
-                hit = search_modrinth_plugin(row["plugin_name"])
-                if not hit:
-                    hit = search_hangar_project(row["plugin_name"])
-                if not hit:
-                    return {
-                        "source_type": resolved_source_type,
-                        "source_id": resolved_source_id,
-                        "source_title": resolved_title,
-                        "latest_version": latest_version,
-                        "latest_download_url": latest_download_url,
-                        "update_available": 0,
-                        "last_checked": now_iso(),
-                        "last_error": "配布サイト未対応または未検出",
-                    }
-
-                if hit.get("source_type") == "hangar":
-                    resolved_source_type = "hangar"
-                    resolved_source_id = hit.get("source_id", "")
-                    resolved_title = hit.get("source_title") or row["plugin_name"]
-                    release = get_hangar_release(resolved_source_id, server_version=server_version, server_software=server_software)
+                spiget_candidate = (
+                    extract_spiget_resource_id(resolved_source_id)
+                    or extract_spiget_resource_id(resolved_title)
+                    or extract_spiget_resource_id(str(row_get(row, "plugin_name") or ""))
+                )
+                if spiget_candidate:
+                    resolved_source_type = "spiget"
+                    resolved_source_id = spiget_candidate
+                    release = get_spiget_release(spiget_candidate, server_version=server_version, server_software=server_software)
+                    if not release:
+                        raise RuntimeError(
+                            f"指定条件に対応するSpiget版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
+                        )
                 else:
-                    project_id = hit.get("project_id", "")
-                    resolved_source_id = project_id
-                    resolved_source_type = "modrinth"
-                    resolved_title = hit.get("title") or hit.get("slug") or row["plugin_name"]
-                    release = get_modrinth_release(
-                        project_id,
-                        server_version=server_version,
-                        server_software=server_software,
-                        version_channel=self._get_modrinth_version_channel(),
-                    )
-                if not release:
-                    raise RuntimeError(
-                        f"指定条件に対応する{resolved_source_type.capitalize()}版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
-                    )
+                    hit = search_modrinth_plugin(row["plugin_name"])
+                    if not hit:
+                        hit = search_hangar_project(row["plugin_name"])
+                    if not hit:
+                        return {
+                            "source_type": resolved_source_type,
+                            "source_id": resolved_source_id,
+                            "source_title": resolved_title,
+                            "latest_version": latest_version,
+                            "latest_download_url": latest_download_url,
+                            "update_available": 0,
+                            "last_checked": now_iso(),
+                            "last_error": "配布サイト未対応または未検出",
+                        }
+
+                    if hit.get("source_type") == "hangar":
+                        resolved_source_type = "hangar"
+                        resolved_source_id = hit.get("source_id", "")
+                        resolved_title = hit.get("source_title") or row["plugin_name"]
+                        release = get_hangar_release(resolved_source_id, server_version=server_version, server_software=server_software)
+                    else:
+                        project_id = hit.get("project_id", "")
+                        resolved_source_id = project_id
+                        resolved_source_type = "modrinth"
+                        resolved_title = hit.get("title") or hit.get("slug") or row["plugin_name"]
+                        release = get_modrinth_release(
+                            project_id,
+                            server_version=server_version,
+                            server_software=server_software,
+                            version_channel=self._get_modrinth_version_channel(),
+                        )
+                    if not release:
+                        raise RuntimeError(
+                            f"指定条件に対応する{resolved_source_type.capitalize()}版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
+                        )
 
             latest_version = release["version"]
             latest_download_url = release["download_url"]
