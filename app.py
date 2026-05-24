@@ -789,6 +789,7 @@ def get_spiget_release(resource_ref: str, server_version: str = "", server_softw
         "project_id": ref,
         "title": title,
         "version": version_name,
+        "version_id": version_id,
         "download_url": download_url,
         "date_published": date_published,
         "matched_server_version": (server_version or "").strip(),
