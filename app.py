@@ -35,12 +35,14 @@ DB_PATH = APP_DIR / "plugin-manager.sqlite"
 MODRINTH_SEARCH_URL = "https://api.modrinth.com/v2/search"
 MODRINTH_VERSIONS_URL = "https://api.modrinth.com/v2/project/{project_id}/version"
 MODRINTH_PROJECT_PAGE_URL = "https://modrinth.com/plugin/{project_id}"
+MODRINTH_VERSION_PAGE_URL = "https://modrinth.com/plugin/{project_id}/version/{version_id}"
 USER_AGENT = "MinecraftPluginAutoUpdateChecker/1.0"
 MODRINTH_PROJECT_URL = "https://api.modrinth.com/v2/project/{project_id}"
 HANGAR_PROJECTS_URL = "https://hangar.papermc.io/api/v1/projects"
 HANGAR_PROJECT_URL = "https://hangar.papermc.io/api/v1/projects/{owner}/{slug}"
 HANGAR_PROJECT_VERSIONS_URL = "https://hangar.papermc.io/api/v1/projects/{owner}/{slug}/versions"
 HANGAR_PROJECT_PAGE_URL = "https://hangar.papermc.io/{owner}/{slug}"
+HANGAR_VERSION_PAGE_URL = "https://hangar.papermc.io/{owner}/{slug}/versions/{version_id}"
 GITHUB_REPO_URL = "https://api.github.com/repos/{owner}/{repo}"
 GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/{owner}/{repo}/releases/latest"
 GITHUB_RELEASES_URL = "https://api.github.com/repos/{owner}/{repo}/releases"
@@ -490,6 +492,7 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
         "project_id": project_id,
         "title": latest.get("name") or latest.get("version_number") or project_id,
         "version": latest.get("version_number") or latest.get("name") or "",
+        "version_id": latest.get("id") or "",
         "download_url": download_url,
         "date_published": latest.get("date_published", ""),
         "matched_server_version": target_version,
@@ -641,6 +644,7 @@ def get_hangar_release(project_ref: str, server_version: str = "", server_softwa
         "project_id": ref,
         "title": latest.get("name") or slug,
         "version": latest.get("name") or slug,
+        "version_id": latest.get("id") or "",
         "download_url": download_url,
         "date_published": latest.get("createdAt", ""),
         "matched_server_version": target_version,
@@ -816,9 +820,9 @@ def format_source_label(source_type: str | None, source_title: str | None, sourc
     if st == "github":
         return "GitHub"
     if st == "spiget":
-        return "Spiget"
+        return "SpigotMC"
     if st == "spigot":
-        return "Spiget"
+        return "SpigotMC"
     if st in ("manual", "listing") or (source_id and str(source_id).startswith("listing://")):
         return "手動"
     # fallback to visible title if given
@@ -1835,7 +1839,7 @@ class PluginManagerApp(Tk):
         current = str(row_get(row, "source_id") or "")
         return simpledialog.askstring(
             title,
-            "配布元の URL または project ref を入力してください。Spiget は resource ID でも可です。",
+            "配布元の URL または project ref を入力してください。SpigotMC は resource ID でも可です。",
             initialvalue=current,
             parent=self,
         )
@@ -1953,7 +1957,7 @@ class PluginManagerApp(Tk):
             except Exception:
                 project_title = project_title or github_ref
         else:
-            messagebox.showwarning("URL無効", "Modrinth / Hangar / GitHub / Spiget の project URL または project ref を入力してください。")
+            messagebox.showwarning("URL無効", "Modrinth / Hangar / GitHub / SpigotMC の project URL または project ref を入力してください。")
             return False
 
         file_path = str(row_get(row, "file_path") or "")
@@ -2171,7 +2175,7 @@ class PluginManagerApp(Tk):
     def _add_plugin_from_source_url(self) -> None:
         source_value = simpledialog.askstring(
             "配布元URLで追加",
-            "配布元の URL または project ref を入力してください。Spiget は resource ID でも可です。",
+            "配布元の URL または project ref を入力してください。SpigotMC は resource ID でも可です。",
             parent=self,
         )
         if source_value is None:
@@ -2254,7 +2258,7 @@ class PluginManagerApp(Tk):
         current_value = str(row_get(row, "source_id") or "")
         new_value = simpledialog.askstring(
             "URLを変更",
-            "配布元の URL または project ref を入力してください。Spiget は resource ID でも可です。",
+            "配布元の URL または project ref を入力してください。SpigotMC は resource ID でも可です。",
             initialvalue=current_value,
             parent=self,
         )
@@ -2955,6 +2959,94 @@ class PluginManagerApp(Tk):
         btn_frame.pack(fill=X, pady=(8, 4))
         ttk.Button(btn_frame, text="すべて選択", command=select_all).pack(side=LEFT, padx=6)
         ttk.Button(btn_frame, text="すべて解除", command=deselect_all).pack(side=LEFT, padx=6)
+        def open_source_for_selected():
+            iid = tree.focus()
+            if not iid:
+                messagebox.showinfo("選択なし", "先に一覧の項目を1つ選択してください。")
+                return
+            item = item_map.get(iid)
+            if not item:
+                messagebox.showinfo("選択なし", "先に一覧の項目を1つ選択してください。")
+                return
+            row = item.get("row")
+            # try to resolve to DB row when possible
+            if isinstance(row, dict) and "result" in row:
+                result = row_get(row, "result") or {}
+                file_path = row_get(row, "file_path")
+                try:
+                    dbrow = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+                except Exception:
+                    dbrow = None
+                if dbrow is not None:
+                    self._open_homepage_for_row(dbrow)
+                    return
+                source_type = row_get(result, "source_type") or ""
+                source_id = row_get(result, "source_id") or ""
+                source_title = row_get(result, "source_title") or ""
+                plugin_name = source_title or file_path or ""
+            else:
+                dbrow = row
+                source_type = row_get(dbrow, "source_type")
+                source_id = row_get(dbrow, "source_id")
+                source_title = row_get(dbrow, "source_title")
+                plugin_name = row_get(dbrow, "plugin_name")
+
+            try:
+                # prefer opening a page for the specific version if available
+                if isinstance(row, dict) and "result" in row:
+                    result = row_get(row, "result") or {}
+                    # Modrinth: open version page if we have project_id + version_id
+                    if (result.get("project_id") or source_id) and result.get("version_id") and source_type == "modrinth":
+                        proj = result.get("project_id") or source_id
+                        webbrowser.open(MODRINTH_VERSION_PAGE_URL.format(project_id=proj, version_id=result.get("version_id")))
+                        return
+                    # Hangar: owner/slug and version_id
+                    if result.get("project_id") and result.get("version_id") and source_type == "hangar":
+                        ref = result.get("project_id")
+                        if "/" in ref:
+                            owner, slug = ref.split("/", 1)
+                            webbrowser.open(HANGAR_VERSION_PAGE_URL.format(owner=owner, slug=slug, version_id=result.get("version_id")))
+                            return
+                    # GitHub: open release by tag if version (tag) available
+                    if source_type == "github" and source_id and result.get("version"):
+                        repo_ref = extract_github_repo_ref(source_id)
+                        if repo_ref:
+                            owner, repo = repo_ref.split("/", 1)
+                            tag = str(result.get("version"))
+                            webbrowser.open(GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo) + f"/releases/tag/{urllib.parse.quote_plus(tag)}")
+                            return
+
+                # fallback: open profile/project pages similar to existing behavior
+                if source_type == "github" and source_id:
+                    repo_ref = extract_github_repo_ref(source_id)
+                    if repo_ref:
+                        owner, repo = repo_ref.split("/", 1)
+                        webbrowser.open(GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo))
+                        return
+                if source_type == "spiget" and source_id:
+                    try:
+                        webbrowser.open(SPIGITMC_PROJECT_PAGE_URL.format(id=source_id))
+                        return
+                    except Exception:
+                        try:
+                            webbrowser.open(SPIGET_PROJECT_PAGE_URL.format(id=source_id))
+                            return
+                        except Exception:
+                            pass
+
+                source_title_val = str(source_title or plugin_name or "").strip()
+                query = urllib.parse.quote_plus(source_title_val)
+                if query:
+                    webbrowser.open(f"https://modrinth.com/plugins?q={query}")
+                    return
+            except Exception:
+                pass
+
+            messagebox.showinfo("ホームページ", "このプラグインのホームページを特定できませんでした。")
+
+        open_src_btn = ttk.Button(btn_frame, text="取得元を開く", command=open_source_for_selected)
+        open_src_btn.pack(side=RIGHT, padx=6)
+        Tooltip(open_src_btn, "選択中の項目の取得元ページをブラウザで開きます")
         result: list[dict] | None = None
 
         def on_ok():
