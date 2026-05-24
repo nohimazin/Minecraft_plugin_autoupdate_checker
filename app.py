@@ -919,6 +919,7 @@ class PluginDatabase:
                     source_id TEXT NOT NULL DEFAULT '',
                     source_title TEXT NOT NULL DEFAULT '',
                     latest_version TEXT NOT NULL DEFAULT '',
+                    latest_version_id TEXT NOT NULL DEFAULT '',
                     latest_download_url TEXT NOT NULL DEFAULT '',
                     update_available INTEGER NOT NULL DEFAULT 0,
                     last_checked TEXT NOT NULL DEFAULT '',
@@ -928,6 +929,13 @@ class PluginDatabase:
                 )
                 """
             )
+            # ensure legacy DBs have the latest_version_id column
+            cols = [r[1] for r in self.connection.execute("PRAGMA table_info(plugins)").fetchall()]
+            if "latest_version_id" not in cols:
+                try:
+                    self.connection.execute("ALTER TABLE plugins ADD COLUMN latest_version_id TEXT NOT NULL DEFAULT ''")
+                except Exception:
+                    pass
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_plugins_name ON plugins(plugin_name)")
 
     def get_setting(self, key: str, default: str = "") -> str:
@@ -1065,6 +1073,7 @@ class PluginDatabase:
         source_id: str,
         source_title: str,
         latest_version: str,
+        latest_version_id: str,
         latest_download_url: str,
         update_available: int,
         last_checked: str,
@@ -1075,7 +1084,7 @@ class PluginDatabase:
                 """
                 UPDATE plugins
                 SET source_type = ?, source_id = ?, source_title = ?, latest_version = ?,
-                    latest_download_url = ?, update_available = ?, last_checked = ?, last_error = ?,
+                    latest_version_id = ?, latest_download_url = ?, update_available = ?, last_checked = ?, last_error = ?,
                     updated_at = ?
                 WHERE file_path = ?
                 """,
@@ -1084,6 +1093,7 @@ class PluginDatabase:
                     source_id,
                     source_title,
                     latest_version,
+                    latest_version_id,
                     latest_download_url,
                     update_available,
                     last_checked,
@@ -1856,6 +1866,7 @@ class PluginManagerApp(Tk):
             source_id=result["source_id"],
             source_title=result["source_title"],
             latest_version=result["latest_version"],
+            latest_version_id=result.get("version_id", ""),
             latest_download_url=result["latest_download_url"],
             update_available=result["update_available"],
             last_checked=result["last_checked"],
@@ -2130,23 +2141,35 @@ class PluginManagerApp(Tk):
     def _open_homepage_for_row(self, row: sqlite3.Row) -> None:
         source_type = normalize_source_type(row_get(row, "source_type"))
         source_id = str(row_get(row, "source_id") or "")
+        latest_version_id = str(row_get(row, "latest_version_id") or "").strip()
+        latest_version = str(row_get(row, "latest_version") or "").strip()
         if source_id.startswith("http://") or source_id.startswith("https://"):
             webbrowser.open(source_id)
             return
         if source_type == "modrinth" and source_id:
-            webbrowser.open(MODRINTH_PROJECT_PAGE_URL.format(project_id=ensure_modrinth_project_id(source_id)))
+            proj = ensure_modrinth_project_id(source_id)
+            if latest_version_id:
+                webbrowser.open(MODRINTH_VERSION_PAGE_URL.format(project_id=proj, version_id=latest_version_id))
+            else:
+                webbrowser.open(MODRINTH_PROJECT_PAGE_URL.format(project_id=proj))
             return
         if source_type == "hangar" and source_id:
             project_ref = extract_hangar_project_ref(source_id)
             if project_ref:
                 owner, slug = project_ref.split("/", 1)
-                webbrowser.open(HANGAR_PROJECT_PAGE_URL.format(owner=owner, slug=slug))
+                if latest_version_id:
+                    webbrowser.open(HANGAR_VERSION_PAGE_URL.format(owner=owner, slug=slug, version_id=latest_version_id))
+                else:
+                    webbrowser.open(HANGAR_PROJECT_PAGE_URL.format(owner=owner, slug=slug))
                 return
         if source_type == "github" and source_id:
             repo_ref = extract_github_repo_ref(source_id)
             if repo_ref:
                 owner, repo = repo_ref.split("/", 1)
-                webbrowser.open(GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo))
+                if latest_version:
+                    webbrowser.open(GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo) + f"/releases/tag/{urllib.parse.quote_plus(latest_version)}")
+                else:
+                    webbrowser.open(GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo))
                 return
         if source_type == "spiget" and source_id:
             try:
@@ -2826,6 +2849,7 @@ class PluginManagerApp(Tk):
                 source_id=result["source_id"],
                 source_title=result["source_title"],
                 latest_version=result["latest_version"],
+                latest_version_id=result.get("version_id", ""),
                 latest_download_url=result["latest_download_url"],
                 update_available=result["update_available"],
                 last_checked=result["last_checked"],
