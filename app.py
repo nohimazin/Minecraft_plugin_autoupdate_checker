@@ -1660,7 +1660,7 @@ class PluginManagerApp(Tk):
         current = str(row_get(row, "source_id") or "")
         return simpledialog.askstring(
             title,
-            "配布サイトの project/repo URL または project ref を入力してください。",
+            "配布元の project/repo URL または project ref を入力してください。",
             initialvalue=current,
             parent=self,
         )
@@ -1778,7 +1778,7 @@ class PluginManagerApp(Tk):
             except Exception:
                 project_title = project_title or github_ref
         else:
-            messagebox.showwarning("URL無効", "Modrinth / Hangar / GitHub の project URL または project ref を入力してください。")
+            messagebox.showwarning("URL無効", "Modrinth / Hangar / GitHub / Spiget の project URL または project ref を入力してください。")
             return False
 
         file_path = str(row_get(row, "file_path") or "")
@@ -2001,7 +2001,7 @@ class PluginManagerApp(Tk):
         current_value = str(row_get(row, "source_id") or "")
         new_value = simpledialog.askstring(
             "URLを変更",
-            "配布サイトの project/repo URL または project ref を入力してください。",
+            "配布元の project/repo URL または project ref を入力してください。",
             initialvalue=current_value,
             parent=self,
         )
