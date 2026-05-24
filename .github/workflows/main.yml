@@ -26,13 +26,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Pythonセットアップ
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # pipキャッシュ
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -42,7 +40,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # Nuitkaキャッシュ
       - name: Cache Nuitka
         uses: actions/cache@v4
         with:
@@ -52,49 +49,44 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-nuitka-
 
-      # 依存インストール
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
 
-          pip install ^
-            nuitka ^
-            ordered-set ^
-            zstandard ^
+          pip install `
+            nuitka `
+            ordered-set `
+            zstandard `
             pillow
 
-          if exist requirements.txt (
+          if (Test-Path requirements.txt) {
             pip install -r requirements.txt
-          )
+          }
 
-      # Nuitkaビルド
       - name: Build standalone app
         run: |
-          python -m nuitka ^
-            --standalone ^
-            --enable-plugin=tk-inter ^
-            --windows-console-mode=disable ^
-            --include-package=PIL ^
-            --assume-yes-for-downloads ^
-            --output-dir=build ^
-            --output-filename=MinecraftPluginAutoUpdateChecker.exe ^
+          python -m nuitka `
+            --standalone `
+            --enable-plugin=tk-inter `
+            --windows-console-mode=disable `
+            --include-package=PIL `
+            --assume-yes-for-downloads `
+            --output-dir=build `
+            --output-filename=MinecraftPluginAutoUpdateChecker.exe `
             app.py
 
-      # ZIP化
       - name: Compress build
         run: |
-          powershell Compress-Archive `
+          Compress-Archive `
             -Path build/app.dist/* `
             -DestinationPath MinecraftPluginAutoUpdateChecker-windows.zip
 
-      # Artifact保存
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MinecraftPluginAutoUpdateChecker-windows
           path: MinecraftPluginAutoUpdateChecker-windows.zip
 
-      # GitHub Releaseへ自動添付
       - name: Upload release asset
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
