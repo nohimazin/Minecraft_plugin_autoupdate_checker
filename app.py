@@ -49,6 +49,7 @@ SPIGET_VERSIONS_URL = "https://api.spiget.org/v2/resources/{id}/versions"
 SPIGET_DOWNLOAD_URL = "https://api.spiget.org/v2/resources/{id}/download?version={version_id}"
 SPIGET_PROJECT_PAGE_URL = "https://spiget.org/resource/{id}"
 SPIGITMC_PROJECT_PAGE_URL = "https://www.spigotmc.org/resources/{id}/"
+SPIGET_ICON_BASE_URL = "https://www.spigotmc.org/"
 SERVER_SOFTWARE_OPTIONS = ["自動", "Paper", "Spigot", "Bukkit", "Purpur"]
 SERVER_SOFTWARE_LOADERS = {
     "paper": ["paper", "spigot", "bukkit"],
@@ -1138,7 +1139,7 @@ class IconManager:
                         except Exception:
                             icon_url = None
                     if icon_url:
-                        icon_url = urllib.parse.urljoin("https://api.spiget.org/", str(icon_url))
+                        icon_url = urllib.parse.urljoin(SPIGET_ICON_BASE_URL, str(icon_url))
                         # Spiget's icon URL often ends in .jpg while the payload is actually PNG.
                         # Keep the fetched bytes, but normalize the cache extension to .png when the
                         # response is PNG-like so non-Pillow environments can load it.
