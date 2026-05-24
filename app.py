@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import threading
 import traceback
+import concurrent.futures
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -82,6 +83,58 @@ def loader_candidates_for_software(value: str) -> list[str]:
     if not normalized:
         return []
     return SERVER_SOFTWARE_LOADERS.get(normalized, [normalized])
+
+
+class Tooltip:
+    """Simple tooltip for a Tk widget."""
+    def __init__(self, widget, text: str, delay: int = 500) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._after_id: str | None = None
+        self.tipwindow: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, event=None) -> None:
+        self._unschedule()
+        try:
+            self._after_id = self.widget.after(self.delay, self._show)
+        except Exception:
+            self._after_id = None
+
+    def _unschedule(self) -> None:
+        if self._after_id:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self, event=None) -> None:
+        if self.tipwindow or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 20
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 1
+            tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            label = tk.Label(tw, text=self.text, justify='left', background='#ffffe0', relief='solid', borderwidth=1)
+            label.pack(ipadx=6, ipady=3)
+            self.tipwindow = tw
+        except Exception:
+            self.tipwindow = None
+
+    def _hide(self, event=None) -> None:
+        self._unschedule()
+        if self.tipwindow:
+            try:
+                self.tipwindow.destroy()
+            except Exception:
+                pass
+            self.tipwindow = None
 
 
 def extract_modrinth_project_id(value: str) -> str:
@@ -1244,6 +1297,13 @@ class PluginManagerApp(Tk):
         self.server_version = StringVar(value=self.database.get_setting("server_version", ""))
         self.server_software = StringVar(value=self.database.get_setting("server_software", ""))
         self.modrinth_version_channel = StringVar(value=modrinth_version_channel_label(self.database.get_setting("modrinth_version_channel", "release")))
+        # concurrency workers setting (defaults to min(8, cpu*2))
+        default_workers = min(8, max(2, (os.cpu_count() or 2) * 2))
+        try:
+            saved_workers = int(self.database.get_setting("concurrency_workers", str(default_workers)))
+        except Exception:
+            saved_workers = default_workers
+        self.concurrency_workers = tk.IntVar(value=saved_workers)
         self.status_text = StringVar(value=f"DB: {DB_PATH}")
         self.busy_text = StringVar(value="待機中")
         self.db_count_text = StringVar(value="DB件数: 0")
@@ -1262,10 +1322,16 @@ class PluginManagerApp(Tk):
         self._server_settings_after_id = None
 
         self._build_ui()
+        # make sure initial UI is rendered before doing heavier work
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
         self._setup_context_menu_bindings()
         self._save_server_settings()
         self.after(100, self._poll_task_queue)
-        self.reload_tree()
+        # Defer the initial full reload so the window becomes responsive immediately.
+        self.after(200, self.reload_tree)
         if self.plugin_folder.get():
             self._log(f"前回のプラグインフォルダを読み込みました: {self.plugin_folder.get()}")
 
@@ -1293,9 +1359,18 @@ class PluginManagerApp(Tk):
         folder_frame = ttk.LabelFrame(top, text="プラグインフォルダ")
         folder_frame.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
 
-        ttk.Entry(folder_frame, textvariable=self.plugin_folder).pack(side=LEFT, fill=X, expand=True, padx=8, pady=8)
-        ttk.Button(folder_frame, text="選択", command=self.choose_folder).pack(side=LEFT, padx=(0, 8), pady=8)
-        ttk.Button(folder_frame, text="スキャン", command=self.scan_folder).pack(side=LEFT, padx=(0, 8), pady=8)
+        plugin_folder_entry = ttk.Entry(folder_frame, textvariable=self.plugin_folder)
+        plugin_folder_entry.pack(side=LEFT, fill=X, expand=True, padx=8, pady=8)
+        choose_btn = ttk.Button(folder_frame, text="選択", command=self.choose_folder)
+        choose_btn.pack(side=LEFT, padx=(0, 8), pady=8)
+        scan_btn = ttk.Button(folder_frame, text="スキャン", command=self.scan_folder)
+        scan_btn.pack(side=LEFT, padx=(0, 8), pady=8)
+        try:
+            Tooltip(plugin_folder_entry, "プラグインが置かれたフォルダのパス。\nスキャンでこのフォルダ内の .jar を登録します。")
+            Tooltip(choose_btn, "プラグインフォルダを選択します。")
+            Tooltip(scan_btn, "選択したフォルダ内の .jar を検出してDBに登録します。")
+        except Exception:
+            pass
 
         server_frame = ttk.LabelFrame(top, text="サーバー設定")
         server_frame.pack(side=LEFT, fill=X, expand=True)
@@ -1313,7 +1388,6 @@ class PluginManagerApp(Tk):
             width=10,
         )
         server_software_combo.pack(side=LEFT, padx=(0, 10), pady=8)
-        ttk.Label(server_frame, text="更新確認とダウンロードに使用").pack(side=LEFT, padx=(0, 8), pady=8)
 
         ttk.Label(server_frame, text="チャンネル").pack(side=LEFT, padx=(0, 4), pady=8)
         modrinth_version_combo = ttk.Combobox(
@@ -1325,24 +1399,55 @@ class PluginManagerApp(Tk):
         )
         modrinth_version_combo.pack(side=LEFT, padx=(0, 10), pady=8)
 
+        # Concurrency control for update checks
+        ttk.Label(server_frame, text="並列ワーカー").pack(side=LEFT, padx=(0, 4), pady=8)
+        try:
+            spin = tk.Spinbox(server_frame, from_=1, to=32, width=3, textvariable=self.concurrency_workers)
+        except Exception:
+            spin = tk.Entry(server_frame, width=3, textvariable=self.concurrency_workers)
+        spin.pack(side=LEFT, padx=(0, 10), pady=8)
+        try:
+            Tooltip(server_version_entry, "サーバーの Minecraft バージョン。\n更新判定時の絞り込みに使用します。例: 1.21.1")
+            Tooltip(server_software_combo, "サーバーソフトを指定します。\n'自動'にすると推測に任せます。")
+            Tooltip(modrinth_version_combo, "Modrinth で取得するバージョンチャンネル。\n安定版のみ/ベータ含む/アルファ含む を切り替えます。")
+            Tooltip(spin, "更新確認で同時に実行するワーカー数。\n値を大きくすると処理は速くなりますが、\n同時接続が増えるため公開APIへの負荷が高まり、\nアクセス制限（ブロック）される可能性があります。\n安全な目安: 4〜8")
+        except Exception:
+            pass
+
         self.server_version.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.server_software.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.modrinth_version_channel.trace_add("write", lambda *args: self._schedule_server_settings_save())
+        self.concurrency_workers.trace_add("write", lambda *args: self._schedule_server_settings_save())
         server_software_combo.bind("<<ComboboxSelected>>", lambda event: self._schedule_server_settings_save())
         modrinth_version_combo.bind("<<ComboboxSelected>>", lambda event: self._schedule_server_settings_save())
 
         listing_frame = ttk.LabelFrame(outer, text="一覧から取り込み")
         listing_frame.pack(fill=X, pady=(10, 0))
 
-        ttk.Label(listing_frame, text="ls等の出力を貼り付け: ").pack(side=LEFT, padx=(8, 4), pady=8)
-        ttk.Label(listing_frame, text="取り込み名: manual listing").pack(side=LEFT, padx=(0, 8), pady=8)
-        ttk.Button(listing_frame, text="ファイルから読込", command=self.load_listing_file).pack(side=LEFT, padx=(0, 8), pady=8)
-        ttk.Button(listing_frame, text="取り込み", command=self.import_listing_text).pack(side=LEFT, padx=(0, 8), pady=8)
+        listing_top = ttk.Frame(listing_frame)
+        listing_top.pack(fill=X, padx=8, pady=(8, 6))
+
+        listing_left = ttk.Frame(listing_top)
+        listing_left.pack(side=LEFT, fill=X, expand=True)
+        ttk.Label(listing_left, text="ls等の出力を貼り付け: ").pack(side=LEFT, padx=(0, 4))
+        ttk.Label(listing_left, text="取り込み名: manual listing").pack(side=LEFT, padx=(0, 8))
+        file_from_btn = ttk.Button(listing_left, text="ファイルから読込", command=self.load_listing_file)
+        file_from_btn.pack(side=LEFT, padx=(0, 8))
+        import_btn = ttk.Button(listing_left, text="取り込み", command=self.import_listing_text)
+        import_btn.pack(side=LEFT)
+
+        add_from_url_btn = ttk.Button(listing_top, text="配布元URLでプラグインを追加", command=self._add_plugin_from_source_url)
+        add_from_url_btn.pack(side=RIGHT)
+        try:
+            Tooltip(file_from_btn, "ローカルの一覧テキストから .jar 名を取り込む")
+            Tooltip(import_btn, "貼り付けた一覧から .jar をDBに登録する")
+            Tooltip(add_from_url_btn, "配布元のURLや project ref からプラグインを手動追加する")
+            Tooltip(self.listing_text, "ls 等の出力を貼り付ける領域。\nここから .jar 名を抽出して登録します。")
+        except Exception:
+            pass
 
         self.listing_text = __import__("tkinter").Text(listing_frame, height=4, wrap="none")
         self.listing_text.pack(fill=X, padx=8, pady=(0, 8))
-
-        # 操作ボタンはメインエリア右側のサイドバーに移動しました
 
         progress_frame = ttk.LabelFrame(outer, text="進捗")
         progress_frame.pack(fill=X, pady=(10, 0))
@@ -1368,11 +1473,19 @@ class PluginManagerApp(Tk):
         search_entry.bind("<Return>", on_search_enter)
         # live filter: reload on every key release (即時フィルタ)
         search_entry.bind("<KeyRelease>", lambda e: self.reload_tree())
-        ttk.Button(search_frame, text="検索", command=self.reload_tree).pack(side=LEFT, padx=(0, 6))
+        search_btn = ttk.Button(search_frame, text="検索", command=self.reload_tree)
+        search_btn.pack(side=LEFT, padx=(0, 6))
         def clear_search():
             self.search_text.set("")
             self.reload_tree()
-        ttk.Button(search_frame, text="クリア", command=clear_search).pack(side=LEFT)
+        clear_btn = ttk.Button(search_frame, text="クリア", command=clear_search)
+        clear_btn.pack(side=LEFT)
+        try:
+            Tooltip(search_entry, "プラグイン名やファイル名で一覧をフィルタします。\nEnter で即時検索")
+            Tooltip(search_btn, "現在の検索条件で一覧を再読み込みします")
+            Tooltip(clear_btn, "検索条件をクリアします")
+        except Exception:
+            pass
 
         list_frame = ttk.Frame(list_area)
         list_frame.pack(fill=BOTH, expand=True)
@@ -1397,17 +1510,75 @@ class PluginManagerApp(Tk):
         
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
-        sidebar = ttk.LabelFrame(upper_area, text="操作")
-        sidebar.pack(side=RIGHT, fill=Y, padx=(8, 0), pady=0)
-        ttk.Button(sidebar, text="更新を確認 (U)", command=self.check_updates).pack(fill=X, padx=8, pady=(8, 4))
-        ttk.Button(sidebar, text="一括ダウンロード", command=self.download_updates_manually).pack(fill=X, padx=8, pady=4)
-        ttk.Button(sidebar, text="バージョンを変更", command=self._change_selected_version).pack(fill=X, padx=8, pady=4)
-        ttk.Button(sidebar, text="ファイルを追加 (A)", command=lambda: messagebox.showinfo('情報','未実装')).pack(fill=X, padx=8, pady=4)
-        ttk.Button(sidebar, text="削除 (R)", command=self._delete_selected_plugin).pack(fill=X, padx=8, pady=4)
-        ttk.Button(sidebar, text="取得元のページを開く", command=self._open_selected_homepage).pack(fill=X, padx=8, pady=4)
-        ttk.Button(sidebar, text="URLを変更", command=self._edit_selected_source_url).pack(fill=X, padx=8, pady=4)
-        ttk.Button(sidebar, text="マッチ失敗一覧", command=self.show_failed_matches).pack(fill=X, padx=8, pady=4)
-        ttk.Button(sidebar, text="リストをエクスポート", command=self._export_plugins).pack(fill=X, padx=8, pady=(4,8))
+        sidebar_frame = ttk.LabelFrame(upper_area, text="操作")
+        sidebar_frame.pack(side=RIGHT, fill=Y, padx=(8, 0), pady=0)
+
+        sidebar_canvas = tk.Canvas(sidebar_frame, highlightthickness=0, borderwidth=0, width=190)
+        sidebar_scrollbar = ttk.Scrollbar(sidebar_frame, orient="vertical", command=sidebar_canvas.yview)
+        sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+        sidebar_canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        sidebar_scrollbar.pack(side=RIGHT, fill=Y)
+
+        sidebar = ttk.Frame(sidebar_canvas)
+        sidebar_window = sidebar_canvas.create_window((0, 0), window=sidebar, anchor="nw")
+
+        def _update_sidebar_scrollregion(event=None) -> None:
+            sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+            sidebar_canvas.itemconfigure(sidebar_window, width=sidebar_canvas.winfo_width())
+
+        def _sidebar_on_mousewheel(event) -> str:
+            widget = event.widget
+            while widget is not None:
+                if widget == sidebar_frame:
+                    break
+                widget = getattr(widget, "master", None)
+            else:
+                return ""
+
+            delta = 0
+            if hasattr(event, "delta") and event.delta:
+                delta = -1 if event.delta > 0 else 1
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                sidebar_canvas.yview_scroll(delta, "units")
+            return "break"
+
+        sidebar.bind("<Configure>", _update_sidebar_scrollregion)
+        sidebar_canvas.bind("<Configure>", _update_sidebar_scrollregion)
+        sidebar_canvas.bind_all("<MouseWheel>", _sidebar_on_mousewheel, add="+")
+        sidebar_canvas.bind_all("<Button-4>", _sidebar_on_mousewheel, add="+")
+        sidebar_canvas.bind_all("<Button-5>", _sidebar_on_mousewheel, add="+")
+
+        bulk_dl_btn = ttk.Button(sidebar, text="一括ダウンロード", command=self.download_updates_manually)
+        bulk_dl_btn.pack(fill=X, padx=8, pady=4)
+        check_updates_btn = ttk.Button(sidebar, text="更新を確認", command=self.check_updates)
+        check_updates_btn.pack(fill=X, padx=8, pady=4)
+        failed_list_btn = ttk.Button(sidebar, text="マッチ失敗一覧", command=self.show_failed_matches)
+        failed_list_btn.pack(fill=X, padx=8, pady=4)
+        open_homepage_btn = ttk.Button(sidebar, text="提供元のページを開く", command=self._open_selected_homepage)
+        open_homepage_btn.pack(fill=X, padx=8, pady=4)
+        change_version_btn = ttk.Button(sidebar, text="バージョンを変更", command=self._change_selected_version)
+        change_version_btn.pack(fill=X, padx=8, pady=4)
+        delete_btn = ttk.Button(sidebar, text="削除", command=self._delete_selected_plugin)
+        delete_btn.pack(fill=X, padx=8, pady=4)
+        edit_url_btn = ttk.Button(sidebar, text="URLを変更", command=self._edit_selected_source_url)
+        edit_url_btn.pack(fill=X, padx=8, pady=4)
+        export_btn = ttk.Button(sidebar, text="リストをエキスポート", command=self._export_plugins)
+        export_btn.pack(fill=X, padx=8, pady=(4, 8))
+        try:
+            Tooltip(bulk_dl_btn, "プラグインの更新を確認し、一括でダウンロードします")
+            Tooltip(check_updates_btn, "一覧の全プラグインについて最新版の有無を確認します")
+            Tooltip(failed_list_btn, "自動マッチに失敗したプラグインを一覧表示します")
+            Tooltip(open_homepage_btn, "選択中のプラグインの配布元ページをブラウザで開きます")
+            Tooltip(change_version_btn, "選択中のプラグインの現在の版を手動で変更します")
+            Tooltip(delete_btn, "選択中のプラグインを一覧から削除します")
+            Tooltip(edit_url_btn, "選択中のプラグインの配布元 URL / project ref を編集します")
+            Tooltip(export_btn, "DB のプラグイン一覧をCSVで書き出します")
+        except Exception:
+            pass
 
         detail_notebook = ttk.Notebook(main_area)
 
@@ -1594,6 +1765,10 @@ class PluginManagerApp(Tk):
         self.database.set_setting("server_version", version)
         self.database.set_setting("server_software", software)
         self.database.set_setting("modrinth_version_channel", modrinth_channel)
+        try:
+            self.database.set_setting("concurrency_workers", str(int(self.concurrency_workers.get())))
+        except Exception:
+            pass
         self.status_text.set(f"DB: {DB_PATH} / サーバー: {software or '自動'} {version or '-'}")
 
     def _get_server_context(self) -> tuple[str, str]:
@@ -1660,7 +1835,7 @@ class PluginManagerApp(Tk):
         current = str(row_get(row, "source_id") or "")
         return simpledialog.askstring(
             title,
-            "配布元の project/repo URL または project ref を入力してください。",
+            "配布元の URL または project ref を入力してください。Spiget は resource ID でも可です。",
             initialvalue=current,
             parent=self,
         )
@@ -1993,6 +2168,84 @@ class PluginManagerApp(Tk):
         if row is not None:
             self._open_homepage_for_row(row)
 
+    def _add_plugin_from_source_url(self) -> None:
+        source_value = simpledialog.askstring(
+            "配布元URLで追加",
+            "配布元の URL または project ref を入力してください。Spiget は resource ID でも可です。",
+            parent=self,
+        )
+        if source_value is None:
+            return
+        source_value = source_value.strip()
+        if not source_value:
+            return
+
+        current_version = simpledialog.askstring(
+            "現在の版",
+            "すでに導入済みの版があれば入力してください。空欄なら未設定で追加します。",
+            parent=self,
+        )
+        if current_version is None:
+            return
+        current_version = current_version.strip()
+
+        temp_key = hashlib.sha1(f"{source_value}|{time.time_ns()}".encode("utf-8", errors="ignore")).hexdigest()
+        file_path = f"manual://pending/{temp_key}"
+        self.database.upsert_local_plugins(
+            [
+                PluginEntry(
+                    plugin_name="手動追加",
+                    current_version=current_version,
+                    file_name="manual.jar",
+                    file_path=file_path,
+                )
+            ]
+        )
+
+        row = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+        if row is None:
+            messagebox.showerror("追加失敗", "新規プラグインの登録に失敗しました。")
+            return
+
+        if not self._apply_manual_match_url(row, source_value):
+            with self.database.connection:
+                self.database.connection.execute("DELETE FROM plugins WHERE file_path = ?", (file_path,))
+            self.reload_tree()
+            return
+
+        resolved_row = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+        if resolved_row is not None:
+            resolved_title = str(row_get(resolved_row, "source_title") or row_get(resolved_row, "plugin_name") or "手動追加")
+            resolved_file_name = f"{safe_filename(resolved_title)}.jar"
+            update_available = int(row_get(resolved_row, "update_available") or 0)
+            latest_download_url = str(row_get(resolved_row, "latest_download_url") or "")
+            latest_version = str(row_get(resolved_row, "latest_version") or "")
+
+            if not current_version and latest_download_url:
+                update_available = 1
+            elif current_version and latest_version:
+                update_available = 1 if compare_versions(latest_version, current_version) > 0 else 0
+
+            with self.database.connection:
+                self.database.connection.execute(
+                    """
+                    UPDATE plugins
+                    SET plugin_name = ?, file_name = ?, current_version = ?, update_available = ?, updated_at = ?
+                    WHERE file_path = ?
+                    """,
+                    (
+                        resolved_title,
+                        resolved_file_name,
+                        current_version,
+                        update_available,
+                        now_iso(),
+                        file_path,
+                    ),
+                )
+
+        self.reload_tree()
+        self._log(f"配布元URLで追加しました: {source_value}")
+
     def _edit_selected_source_url(self) -> None:
         row = self._selected_row_or_warn()
         if row is None:
@@ -2001,7 +2254,7 @@ class PluginManagerApp(Tk):
         current_value = str(row_get(row, "source_id") or "")
         new_value = simpledialog.askstring(
             "URLを変更",
-            "配布元の project/repo URL または project ref を入力してください。",
+            "配布元の URL または project ref を入力してください。Spiget は resource ID でも可です。",
             initialvalue=current_value,
             parent=self,
         )
@@ -2324,10 +2577,18 @@ class PluginManagerApp(Tk):
         resolved_source_id = source_id
         resolved_source_type = source_type or "modrinth"
         server_version, server_software = self._get_server_context()
+        try:
+            pname = row_get(row, "plugin_name") or ""
+            fpath = row_get(row, "file_path") or ""
+        except Exception:
+            pname = str(row.get("plugin_name", ""))
+            fpath = str(row.get("file_path", ""))
+        self._log(f"Resolve start: {pname} ({fpath}) -- stored source_type={row_get(row, 'source_type')} source_id={row_get(row, 'source_id')}")
 
         try:
             if resolved_source_type == "modrinth" and resolved_source_id:
                 project_id = ensure_modrinth_project_id(resolved_source_id)
+                self._log(f"Modrinth branch: resolved_source_id={resolved_source_id} -> project_id={project_id}")
                 if not project_id:
                     return {
                         "source_type": resolved_source_type,
@@ -2352,6 +2613,7 @@ class PluginManagerApp(Tk):
                     )
             elif resolved_source_type == "hangar" and resolved_source_id:
                 project_ref = extract_hangar_project_ref(resolved_source_id)
+                self._log(f"Hangar branch: resolved_source_id={resolved_source_id} -> project_ref={project_ref}")
                 if not project_ref:
                     return {
                         "source_type": resolved_source_type,
@@ -2371,6 +2633,7 @@ class PluginManagerApp(Tk):
                     )
             elif resolved_source_type == "github" and resolved_source_id:
                 repo_ref = extract_github_repo_ref(resolved_source_id)
+                self._log(f"GitHub branch: resolved_source_id={resolved_source_id} -> repo_ref={repo_ref}")
                 if not repo_ref:
                     return {
                         "source_type": resolved_source_type,
@@ -2390,6 +2653,7 @@ class PluginManagerApp(Tk):
                     )
             elif resolved_source_type == "spiget" and resolved_source_id:
                 resource_id = extract_spiget_resource_id(resolved_source_id)
+                self._log(f"Spiget branch: resolved_source_id={resolved_source_id} -> resource_id={resource_id}")
                 if not resource_id:
                     return {
                         "source_type": resolved_source_type,
@@ -2408,35 +2672,16 @@ class PluginManagerApp(Tk):
                         f"指定条件に対応するSpiget版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
                     )
             else:
-                spiget_candidate = (
-                    extract_spiget_resource_id(resolved_source_id)
-                    or extract_spiget_resource_id(resolved_title)
-                    or extract_spiget_resource_id(str(row_get(row, "plugin_name") or ""))
-                )
-                if spiget_candidate:
-                    resolved_source_type = "spiget"
-                    resolved_source_id = spiget_candidate
-                    release = get_spiget_release(spiget_candidate, server_version=server_version, server_software=server_software)
-                    if not release:
-                        raise RuntimeError(
-                            f"指定条件に対応するSpiget版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
-                        )
+                self._log(f"Fallback: searching Modrinth for '{row_get(row, 'plugin_name')}'")
+                hit = search_modrinth_plugin(row["plugin_name"])
+                if hit:
+                    self._log(f"Fallback: Modrinth hit for '{row_get(row, 'plugin_name')}' -> {hit.get('project_id') or hit.get('slug') or hit.get('title')}" )
                 else:
-                    hit = search_modrinth_plugin(row["plugin_name"])
-                    if not hit:
-                        hit = search_hangar_project(row["plugin_name"])
-                    if not hit:
-                        return {
-                            "source_type": resolved_source_type,
-                            "source_id": resolved_source_id,
-                            "source_title": resolved_title,
-                            "latest_version": latest_version,
-                            "latest_download_url": latest_download_url,
-                            "update_available": 0,
-                            "last_checked": now_iso(),
-                            "last_error": "配布サイト未対応または未検出",
-                        }
-
+                    self._log(f"Fallback: Modrinth missed for '{row_get(row, 'plugin_name')}', trying Hangar")
+                    hit = search_hangar_project(row["plugin_name"])
+                    if hit:
+                        self._log(f"Fallback: Hangar hit for '{row_get(row, 'plugin_name')}' -> {hit.get('source_id')}" )
+                if hit:
                     if hit.get("source_type") == "hangar":
                         resolved_source_type = "hangar"
                         resolved_source_id = hit.get("source_id", "")
@@ -2457,10 +2702,37 @@ class PluginManagerApp(Tk):
                         raise RuntimeError(
                             f"指定条件に対応する{resolved_source_type.capitalize()}版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
                         )
+                else:
+                    spiget_candidate = (
+                        extract_spiget_resource_id(resolved_source_id)
+                        or extract_spiget_resource_id(resolved_title)
+                        or extract_spiget_resource_id(str(row_get(row, "plugin_name") or ""))
+                    )
+                    if spiget_candidate:
+                        self._log(f"Fallback: spiget_candidate detected: {spiget_candidate}")
+                        resolved_source_type = "spiget"
+                        resolved_source_id = spiget_candidate
+                        release = get_spiget_release(spiget_candidate, server_version=server_version, server_software=server_software)
+                        if not release:
+                            raise RuntimeError(
+                                f"指定条件に対応するSpiget版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
+                            )
+                    else:
+                        return {
+                            "source_type": resolved_source_type,
+                            "source_id": resolved_source_id,
+                            "source_title": resolved_title,
+                            "latest_version": latest_version,
+                            "latest_download_url": latest_download_url,
+                            "update_available": 0,
+                            "last_checked": now_iso(),
+                            "last_error": "配布サイト未対応または未検出",
+                        }
 
             latest_version = release["version"]
             latest_download_url = release["download_url"]
             resolved_title = resolved_title or release["title"]
+            self._log(f"Resolved: {row_get(row, 'plugin_name')} -> {resolved_source_type}:{resolved_source_id} @ {latest_version}")
 
             update_available = 0
             if current_version and latest_version:
@@ -2477,6 +2749,7 @@ class PluginManagerApp(Tk):
                 "last_error": "",
             }
         except Exception as exc:
+            self._log(f"_resolve_entry_update exception for {row_get(row,'plugin_name')}: {exc}")
             return {
                 "source_type": resolved_source_type,
                 "source_id": resolved_source_id,
@@ -2501,9 +2774,36 @@ class PluginManagerApp(Tk):
         def worker() -> None:
             results: list[dict] = []
             total = len(row_snapshots)
-            for index, row in enumerate(row_snapshots, start=1):
-                results.append({"file_path": row["file_path"], "result": self._resolve_entry_update(row)})
-                self.task_queue.put(("check_updates_progress", (index, total, f"更新確認中 {index} / {total}: {row['plugin_name']}")))
+            # Use a thread pool to resolve multiple entries concurrently to reduce wall-clock time
+            try:
+                max_workers = int(self.concurrency_workers.get())
+                if max_workers < 1:
+                    max_workers = 1
+            except Exception:
+                max_workers = min(8, max(2, (os.cpu_count() or 2) * 2))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as exe:
+                future_to_row = {exe.submit(self._resolve_entry_update, row): row for row in row_snapshots}
+                completed = 0
+                for fut in concurrent.futures.as_completed(future_to_row):
+                    row = future_to_row[fut]
+                    completed += 1
+                    try:
+                        res = fut.result()
+                    except Exception as exc:
+                        # Convert exceptions into a result with last_error so the UI can handle it
+                        res = {
+                            "source_type": "",
+                            "source_id": "",
+                            "source_title": "",
+                            "latest_version": "",
+                            "latest_download_url": "",
+                            "update_available": 0,
+                            "last_checked": now_iso(),
+                            "last_error": str(exc),
+                        }
+                    results.append({"file_path": row["file_path"], "result": res})
+                    # report progress as entries complete
+                    self.task_queue.put(("check_updates_progress", (completed, total, f"更新確認中 {completed} / {total}: {row['plugin_name']}")))
             self.task_queue.put(("check_updates_finished", results))
 
         threading.Thread(target=worker, daemon=True).start()
