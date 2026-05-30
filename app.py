@@ -1709,7 +1709,6 @@ class PluginManagerApp(Tk):
         self.plugin_folder = StringVar(value=self.database.get_setting("plugin_folder", ""))
         self.server_version = StringVar(value=self.database.get_setting("server_version", ""))
         self.server_software = StringVar(value=self.database.get_setting("server_software", ""))
-        self.modrinth_version_channel = StringVar(value=modrinth_version_channel_label(self.database.get_setting("modrinth_version_channel", "release")))
         # concurrency workers setting (defaults to min(8, cpu*2))
         default_workers = min(8, max(2, (os.cpu_count() or 2) * 2))
         try:
@@ -1840,16 +1839,7 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
-        # バージョン/ソフトはサーバー管理ダイアログで設定します
-        ttk.Label(server_frame, text="チャンネル").pack(side=LEFT, padx=(0, 4), pady=8)
-        modrinth_version_combo = ttk.Combobox(
-            server_frame,
-            textvariable=self.modrinth_version_channel,
-            values=tuple(MODRINTH_VERSION_CHANNEL_LABELS.values()),
-            state="readonly",
-            width=12,
-        )
-        modrinth_version_combo.pack(side=LEFT, padx=(0, 10), pady=8)
+        # バージョン/ソフトはサーバー管理ダイアログで設定します（トップ画面には表示しない）
 
         # Concurrency control for update checks
         ttk.Label(server_frame, text="並列ワーカー").pack(side=LEFT, padx=(0, 4), pady=8)
@@ -1859,17 +1849,13 @@ class PluginManagerApp(Tk):
             spin = tk.Entry(server_frame, width=3, textvariable=self.concurrency_workers)
         spin.pack(side=LEFT, padx=(0, 10), pady=8)
         try:
-            Tooltip(modrinth_version_combo, "Modrinth で取得するバージョンチャンネル。\n安定版のみ/ベータ含む/アルファ含む を切り替えます。")
             Tooltip(spin, "更新確認で同時に実行するワーカー数。\n値を大きくすると処理は速くなりますが、\n同時接続が増えるため公開APIへの負荷が高まり、\nアクセス制限（ブロック）される可能性があります。\n安全な目安: 4〜8")
         except Exception:
             pass
 
         self.server_version.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.server_software.trace_add("write", lambda *args: self._schedule_server_settings_save())
-        self.modrinth_version_channel.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.concurrency_workers.trace_add("write", lambda *args: self._schedule_server_settings_save())
-        # server version/software moved to server manager; no widget to bind here
-        modrinth_version_combo.bind("<<ComboboxSelected>>", lambda event: self._schedule_server_settings_save())
 
         listing_frame = ttk.LabelFrame(outer, text="一覧から取り込み")
         listing_frame.pack(fill=X, pady=(10, 0))
@@ -2210,13 +2196,9 @@ class PluginManagerApp(Tk):
     def _save_server_settings(self) -> None:
         version = self.server_version.get().strip()
         software = self.server_software.get().strip()
-        modrinth_channel = normalize_modrinth_version_channel(self.modrinth_version_channel.get())
-        normalized_label = modrinth_version_channel_label(modrinth_channel)
-        if self.modrinth_version_channel.get() != normalized_label:
-            self.modrinth_version_channel.set(normalized_label)
+        # Channel is managed per-server in the server manager; do not keep a global channel setting here.
         self.database.set_setting("server_version", version)
         self.database.set_setting("server_software", software)
-        self.database.set_setting("modrinth_version_channel", modrinth_channel)
         try:
             self.database.set_setting("concurrency_workers", str(int(self.concurrency_workers.get())))
         except Exception:
@@ -2237,7 +2219,6 @@ class PluginManagerApp(Tk):
                         server_version=version,
                         server_software=software,
                         plugin_folder=self.plugin_folder.get() or "",
-                        modrinth_version_channel=modrinth_channel,
                     )
                 except Exception:
                     pass
@@ -2276,7 +2257,16 @@ class PluginManagerApp(Tk):
         return self.server_version.get().strip(), self.server_software.get().strip()
 
     def _get_modrinth_version_channel(self) -> str:
-        return normalize_modrinth_version_channel(self.modrinth_version_channel.get())
+        try:
+            sid = int(self.selected_server_id.get() or 0)
+        except Exception:
+            sid = 0
+        if sid:
+            srv = self.database.get_server(sid)
+            if srv is not None:
+                return normalize_modrinth_version_channel(str(row_get(srv, "modrinth_version_channel") or "release"))
+        # fallback to release when no server selected
+        return "release"
 
     def _apply_server_row_to_ui(self, srv: sqlite3.Row | None) -> None:
         """Apply values from a server row to the main UI StringVars."""
@@ -2293,11 +2283,7 @@ class PluginManagerApp(Tk):
                 self.server_version.set(server_version)
             if server_software:
                 self.server_software.set(server_software)
-            if modrinth_channel:
-                try:
-                    self.modrinth_version_channel.set(modrinth_version_channel_label(modrinth_channel))
-                except Exception:
-                    pass
+            # modrinth channel is displayed/edited in server manager only
         except Exception:
             pass
 
@@ -2590,10 +2576,6 @@ class PluginManagerApp(Tk):
                     self.server_software.set(software)
                 if folder is not None:
                     self.plugin_folder.set(folder)
-                try:
-                    self.modrinth_version_channel.set(modrinth_version_channel_label(modch))
-                except Exception:
-                    pass
                 try:
                     # persist these settings and update server row if needed
                     self._schedule_server_settings_save()
