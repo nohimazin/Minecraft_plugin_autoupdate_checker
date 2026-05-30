@@ -1295,6 +1295,23 @@ def _safe_info(logger: logging.Logger | None, msg: str, *args) -> None:
     def list_servers(self) -> list[sqlite3.Row]:
         return list(self.connection.execute("SELECT * FROM servers ORDER BY name COLLATE NOCASE"))
 
+    def _normalize_server_input(
+        self,
+        name: str,
+        server_version: str = "",
+        server_software: str = "",
+        plugin_folder: str = "",
+        modrinth_version_channel: str = "",
+    ) -> tuple[str, str, str, str, str]:
+        """Normalize and trim server fields before insert/update."""
+        return (
+            str(name or "").strip() or "Default",
+            str(server_version or "").strip(),
+            str(server_software or "").strip(),
+            str(plugin_folder or "").strip(),
+            str(modrinth_version_channel or "").strip(),
+        )
+
     def create_server(
         self,
         name: str,
@@ -1303,11 +1320,13 @@ def _safe_info(logger: logging.Logger | None, msg: str, *args) -> None:
         plugin_folder: str = "",
         modrinth_version_channel: str = "",
     ) -> int:
-        name = str(name or "").strip() or "Default"
-        server_version = str(server_version or "").strip()
-        server_software = str(server_software or "").strip()
-        plugin_folder = str(plugin_folder or "").strip()
-        modrinth_version_channel = str(modrinth_version_channel or "").strip()
+        name, server_version, server_software, plugin_folder, modrinth_version_channel = self._normalize_server_input(
+            name,
+            server_version,
+            server_software,
+            plugin_folder,
+            modrinth_version_channel,
+        )
         now = now_iso()
         with self.connection:
             cur = self.connection.execute(
@@ -1333,11 +1352,13 @@ def _safe_info(logger: logging.Logger | None, msg: str, *args) -> None:
         plugin_folder: str,
         modrinth_version_channel: str = "",
     ) -> None:
-        name = str(name or "").strip() or "Default"
-        server_version = str(server_version or "").strip()
-        server_software = str(server_software or "").strip()
-        plugin_folder = str(plugin_folder or "").strip()
-        modrinth_version_channel = str(modrinth_version_channel or "").strip()
+        name, server_version, server_software, plugin_folder, modrinth_version_channel = self._normalize_server_input(
+            name,
+            server_version,
+            server_software,
+            plugin_folder,
+            modrinth_version_channel,
+        )
         now = now_iso()
         with self.connection:
             self.connection.execute(
@@ -2231,21 +2252,43 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
+    def _set_server_combo_values(self, names: list[str]) -> None:
+        """Set server combo values safely when widget is available."""
+        try:
+            if hasattr(self, "_server_combo_widget") and self._server_combo_widget is not None:
+                self._server_combo_widget["values"] = names
+        except Exception:
+            pass
+
+    def _select_server_by_id(self, target_sid: int | None) -> None:
+        """Select a server by id and sync DB/UI state if the id exists."""
+        try:
+            if target_sid and target_sid in self._server_id_list:
+                idx = self._server_id_list.index(target_sid)
+                self._server_combo_var.set(self._server_name_list[idx])
+                self.selected_server_id.set(target_sid)
+                self.database.set_setting("selected_server_id", str(target_sid))
+                try:
+                    self.database.open_server_db(int(target_sid))
+                except Exception:
+                    pass
+                try:
+                    srv = self.database.get_server(target_sid)
+                    if srv:
+                        self._apply_server_row_to_ui(srv)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _load_servers_to_ui(self) -> None:
         servers = self.database.list_servers()
         if not servers:
             # no servers present — do not auto-create a default entry
-            try:
-                self._logger.info("_load_servers_to_ui: no servers found, leaving UI empty")
-            except Exception:
-                pass
+            _safe_info(self._logger, "_load_servers_to_ui: no servers found, leaving UI empty")
             self._server_name_list = []
             self._server_id_list = []
-            try:
-                if hasattr(self, "_server_combo_widget") and self._server_combo_widget is not None:
-                    self._server_combo_widget["values"] = self._server_name_list
-            except Exception:
-                pass
+            self._set_server_combo_values(self._server_name_list)
             # clear selection state
             try:
                 self._server_combo_var.set("")
@@ -2260,43 +2303,18 @@ class PluginManagerApp(Tk):
 
         self._server_name_list = [s["name"] for s in servers]
         self._server_id_list = [s["id"] for s in servers]
-        # set combobox values
-        try:
-            if hasattr(self, "_server_combo_widget") and self._server_combo_widget is not None:
-                self._server_combo_widget["values"] = self._server_name_list
-        except Exception:
-            pass
+        self._set_server_combo_values(self._server_name_list)
         # select stored server or default
         try:
             sid = int(self.selected_server_id.get() or 0)
         except Exception:
             sid = 0
-        # helper to centralize selection logic
-        def _select_server_id(target_sid: int | None) -> None:
-            try:
-                if target_sid and target_sid in self._server_id_list:
-                    idx = self._server_id_list.index(target_sid)
-                    self._server_combo_var.set(self._server_name_list[idx])
-                    self.selected_server_id.set(target_sid)
-                    self.database.set_setting("selected_server_id", str(target_sid))
-                    try:
-                        self.database.open_server_db(int(target_sid))
-                    except Exception:
-                        pass
-                    try:
-                        srv = self.database.get_server(target_sid)
-                        if srv:
-                            self._apply_server_row_to_ui(srv)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
 
         if sid and sid in self._server_id_list:
-            _select_server_id(sid)
+            self._select_server_by_id(sid)
         else:
             if self._server_name_list:
-                _select_server_id(self._server_id_list[0])
+                self._select_server_by_id(self._server_id_list[0])
         # Ensure main UI fields are updated to reflect the selected server
         try:
             self._on_server_combo_changed()
