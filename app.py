@@ -2260,7 +2260,7 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
-    def _select_server_by_id(self, target_sid: int | None) -> None:
+    def _select_server_by_id(self, target_sid: int | None, reload_tree: bool = False) -> None:
         """Select a server by id and sync DB/UI state if the id exists."""
         try:
             if target_sid and target_sid in self._server_id_list:
@@ -2278,6 +2278,11 @@ class PluginManagerApp(Tk):
                         self._apply_server_row_to_ui(srv)
                 except Exception:
                     pass
+                if reload_tree:
+                    try:
+                        self.reload_tree()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -2299,6 +2304,10 @@ class PluginManagerApp(Tk):
                 self.database.set_setting("selected_server_id", "")
             except Exception:
                 pass
+            try:
+                self.reload_tree()
+            except Exception:
+                pass
             return
 
         self._server_name_list = [s["name"] for s in servers]
@@ -2315,9 +2324,9 @@ class PluginManagerApp(Tk):
         else:
             if self._server_name_list:
                 self._select_server_by_id(self._server_id_list[0])
-        # Ensure main UI fields are updated to reflect the selected server
+        # Refresh plugin list once after switching active server context.
         try:
-            self._on_server_combo_changed()
+            self.reload_tree()
         except Exception:
             pass
 
@@ -2326,19 +2335,7 @@ class PluginManagerApp(Tk):
         if name and name in self._server_name_list:
             idx = self._server_name_list.index(name)
             sid = self._server_id_list[idx]
-            self.selected_server_id.set(sid)
-            self.database.set_setting("selected_server_id", str(sid))
-            try:
-                self.database.open_server_db(sid)
-            except Exception:
-                pass
-            try:
-                server = self.database.get_server(sid)
-                if server:
-                    self._apply_server_row_to_ui(server)
-            except Exception:
-                pass
-            self.reload_tree()
+            self._select_server_by_id(sid, reload_tree=True)
 
     def _open_server_manager(self) -> None:
         dialog = tk.Toplevel(self)
