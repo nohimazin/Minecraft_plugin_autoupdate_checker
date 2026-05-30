@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import json
 import hashlib
 import os
@@ -138,6 +139,21 @@ class Tooltip:
             except Exception:
                 pass
             self.tipwindow = None
+
+
+def _attach_tooltip(widget, text: str) -> None:
+    if widget is None or not text:
+        return
+    try:
+        if getattr(widget, "_tooltip_text", "") == text:
+            return
+    except Exception:
+        pass
+    try:
+        Tooltip(widget, text)
+        widget._tooltip_text = text
+    except Exception:
+        pass
 
 
 def extract_modrinth_project_id(value: str) -> str:
@@ -291,24 +307,23 @@ def extract_jar_names_from_listing(listing_text: str) -> list[str]:
         if line.startswith("total "):
             continue
 
-        candidate = line
+        candidates: list[str] = []
         if re.match(r"^[bcdlps-][rwx-]{9}\s", line):
             parts = line.split(maxsplit=8)
             if len(parts) >= 9:
-                candidate = parts[8]
+                candidates.append(parts[8])
         else:
-            tail_match = re.search(r"(?P<name>[^\r\n]+?\.jar)\s*$", line, re.IGNORECASE)
-            if tail_match:
-                candidate = tail_match.group("name")
+            # ls output can be column-aligned; a single line may contain multiple file names.
+            # Collect every .jar token on the line instead of only the trailing one.
+            candidates.extend(re.findall(r"(?<!\S)([^\s]+?\.jar)(?=\s|$)", line, re.IGNORECASE))
 
-        candidate = Path(candidate.rstrip("/")).name
-
-        if not candidate.lower().endswith(".jar"):
-            continue
-
-        if candidate not in seen:
-            seen.add(candidate)
-            jar_names.append(candidate)
+        for candidate in candidates:
+            candidate = Path(candidate.rstrip("/")).name
+            if not candidate.lower().endswith(".jar"):
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                jar_names.append(candidate)
 
     return jar_names
 
@@ -455,7 +470,53 @@ def modrinth_version_channel_label(value: str) -> str:
     return MODRINTH_VERSION_CHANNEL_LABELS.get(channel, MODRINTH_VERSION_CHANNEL_LABELS["release"])
 
 
-def get_modrinth_release(project_id: str, server_version: str = "", server_software: str = "", version_channel: str = "release") -> dict | None:
+def _modrinth_is_plugin_loader_version(item: dict) -> bool:
+    loaders = {str(loader).lower() for loader in (item.get("loaders") or []) if str(loader).strip()}
+    if not loaders:
+        return True
+    plugin_loaders = {"bukkit", "paper", "spigot", "purpur", "folia", "velocity", "waterfall", "bungeecord"}
+    fabric_like_loaders = {"fabric", "quilt", "forge", "neoforge", "liteloader"}
+    if loaders & plugin_loaders:
+        return True
+    if loaders & fabric_like_loaders:
+        return False
+    return True
+
+
+def _modrinth_loader_hints_from_text(text: str) -> list[str]:
+    lowered = (text or "").lower()
+    hints: list[str] = []
+    mapping = {
+        "bukkit": ("bukkit",),
+        "paper": ("paper",),
+        "spigot": ("spigot",),
+        "purpur": ("purpur",),
+        "folia": ("folia",),
+        "velocity": ("velocity",),
+        "waterfall": ("waterfall",),
+        "bungeecord": ("bungeecord", "bungee"),
+        "fabric": ("fabric",),
+        "quilt": ("quilt",),
+        "forge": ("forge",),
+        "neoforge": ("neoforge",),
+    }
+    for loader, tokens in mapping.items():
+        if any(token in lowered for token in tokens) and loader not in hints:
+            hints.append(loader)
+    return hints
+
+
+def _best_loader_rank(item_loaders: list[str], preferred_loaders: list[str]) -> int:
+    if not preferred_loaders:
+        return 0
+    loader_set = {str(loader).lower() for loader in item_loaders if str(loader).strip()}
+    for index, loader in enumerate(preferred_loaders):
+        if loader in loader_set:
+            return index
+    return len(preferred_loaders)
+
+
+def get_modrinth_release(project_id: str, server_version: str = "", server_software: str = "", version_channel: str = "release", source_title: str = "") -> dict | None:
     versions = http_json(MODRINTH_VERSIONS_URL.format(project_id=project_id))
     if not versions:
         return None
@@ -467,6 +528,9 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
 
     target_version = (server_version or "").strip()
     target_loaders = loader_candidates_for_software(server_software)
+    inferred_loaders = _modrinth_loader_hints_from_text(source_title)
+    if not target_loaders and inferred_loaders:
+        target_loaders = list(inferred_loaders)
 
     def version_matches(item: dict) -> bool:
         item_loaders = [str(loader).lower() for loader in (item.get("loaders") or [])]
@@ -481,12 +545,19 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
     matched_versions = [item for item in versions if version_matches(item)]
     if not matched_versions and not target_version and target_loaders:
         matched_versions = [item for item in versions if any(loader in target_loaders for loader in [str(x).lower() for x in (item.get("loaders") or [])])]
-    if not matched_versions and not target_version and not target_loaders:
-        matched_versions = versions
+    if not matched_versions and not target_loaders:
+        plugin_pref_versions = [item for item in versions if _modrinth_is_plugin_loader_version(item)]
+        matched_versions = plugin_pref_versions or versions
     if not matched_versions:
         return None
 
-    latest = max(matched_versions, key=lambda item: item.get("date_published", ""))
+    preferred_loaders = target_loaders or _modrinth_loader_hints_from_text(source_title)
+
+    def modrinth_sort_key(item: dict) -> tuple[int, str]:
+        item_loaders = [str(loader).lower() for loader in (item.get("loaders") or [])]
+        return (-_best_loader_rank(item_loaders, preferred_loaders), str(item.get("date_published", "")))
+
+    latest = max(matched_versions, key=modrinth_sort_key)
     files = latest.get("files", []) or []
     download_url = files[0].get("url", "") if files else ""
     return {
@@ -503,8 +574,16 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
 
 def hangar_platform_candidates(server_software: str) -> list[str]:
     normalized = normalize_server_software(server_software)
-    if normalized in {"paper", "spigot", "bukkit", "purpur", "folia"}:
-        return ["PAPER"]
+    if normalized == "purpur":
+        return ["PURPUR", "PAPER", "SPIGOT", "BUKKIT"]
+    if normalized == "paper":
+        return ["PAPER", "SPIGOT", "BUKKIT"]
+    if normalized == "spigot":
+        return ["SPIGOT", "BUKKIT"]
+    if normalized == "bukkit":
+        return ["BUKKIT"]
+    if normalized == "folia":
+        return ["FOLIA", "PAPER", "SPIGOT", "BUKKIT"]
     if normalized == "velocity":
         return ["VELOCITY"]
     if normalized in {"waterfall", "bungeecord"}:
@@ -624,7 +703,16 @@ def get_hangar_release(project_ref: str, server_version: str = "", server_softwa
     if not matched_versions:
         return None
 
-    latest = max(matched_versions, key=lambda item: item.get("createdAt", ""))
+    def hangar_sort_key(item: dict) -> tuple[int, str]:
+        platform_dependencies = item.get("platformDependencies") or {}
+        if not target_platforms:
+            return (0, str(item.get("createdAt", "")))
+        for index, platform in enumerate(target_platforms):
+            if platform in platform_dependencies:
+                return (-index, str(item.get("createdAt", "")))
+        return (-(len(target_platforms)), str(item.get("createdAt", "")))
+
+    latest = max(matched_versions, key=hangar_sort_key)
     downloads = latest.get("downloads") or {}
     download_url = ""
     candidate_platforms = target_platforms or list(downloads.keys())
@@ -840,6 +928,34 @@ def format_source_label(source_type: str | None, source_title: str | None, sourc
     if source_id:
         return str(source_id)
     return "-"
+
+
+def build_source_url(source_type: str | None, source_id: str | None) -> str:
+    """Build a provider homepage URL from source type/id when possible."""
+    st = normalize_source_type(source_type)
+    sid = str(source_id or "").strip()
+    if not sid:
+        return ""
+    if sid.startswith("http://") or sid.startswith("https://"):
+        return sid
+    if st == "modrinth":
+        proj = ensure_modrinth_project_id(sid)
+        return MODRINTH_PROJECT_PAGE_URL.format(project_id=proj) if proj else ""
+    if st == "hangar":
+        ref = extract_hangar_project_ref(sid)
+        if ref:
+            owner, slug = ref.split("/", 1)
+            return HANGAR_PROJECT_PAGE_URL.format(owner=owner, slug=slug)
+        return ""
+    if st == "github":
+        ref = extract_github_repo_ref(sid)
+        if ref:
+            owner, repo = ref.split("/", 1)
+            return GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo)
+        return ""
+    if st in {"spiget", "spigot"} and sid:
+        return SPIGITMC_PROJECT_PAGE_URL.format(id=sid)
+    return ""
 
 
 def normalize_source_type(value: str | None) -> str:
@@ -1201,7 +1317,7 @@ class PluginDatabase:
                         _safe_debug(self._logger, "upsert_local_plugins: inserted %s", entry.file_path)
         _safe_info(self._logger, "upsert_local_plugins: inserted=%s updated=%s total=%s", inserted, updated, len(entries))
 
-    def upsert_imported_jars(self, jar_names: list[str], source_label: str = "manual listing") -> int:
+    def upsert_imported_jars(self, jar_names: list[str]) -> int:
         conn = self.server_connection
         if not conn:
             return 0
@@ -1665,7 +1781,6 @@ class PluginManagerApp(Tk):
         self.plugin_folder = StringVar(value=self.database.get_setting("plugin_folder", ""))
         self.server_version = StringVar(value=self.database.get_setting("server_version", ""))
         self.server_software = StringVar(value=self.database.get_setting("server_software", ""))
-        self.modrinth_version_channel = StringVar(value=modrinth_version_channel_label(self.database.get_setting("modrinth_version_channel", "release")))
         # concurrency workers setting (defaults to min(8, cpu*2))
         default_workers = min(8, max(2, (os.cpu_count() or 2) * 2))
         try:
@@ -1787,6 +1902,8 @@ class PluginManagerApp(Tk):
         self._server_combo_widget.bind("<<ComboboxSelected>>", lambda event: self._on_server_combo_changed())
         manage_btn = ttk.Button(server_frame, text="サーバー管理", command=lambda: self._open_server_manager())
         manage_btn.pack(side=LEFT, padx=(0, 8), pady=8)
+        _attach_tooltip(self._server_combo_widget, "操作対象のサーバーを選択します。")
+        _attach_tooltip(manage_btn, "サーバーの追加・編集・削除を開きます。")
 
         # populate server list in main UI now
         try:
@@ -1794,16 +1911,7 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
-        # バージョン/ソフトはサーバー管理ダイアログで設定します
-        ttk.Label(server_frame, text="チャンネル").pack(side=LEFT, padx=(0, 4), pady=8)
-        modrinth_version_combo = ttk.Combobox(
-            server_frame,
-            textvariable=self.modrinth_version_channel,
-            values=tuple(MODRINTH_VERSION_CHANNEL_LABELS.values()),
-            state="readonly",
-            width=12,
-        )
-        modrinth_version_combo.pack(side=LEFT, padx=(0, 10), pady=8)
+        # バージョン/ソフトはサーバー管理ダイアログで設定します（トップ画面には表示しない）
 
         # Concurrency control for update checks
         ttk.Label(server_frame, text="並列ワーカー").pack(side=LEFT, padx=(0, 4), pady=8)
@@ -1813,17 +1921,13 @@ class PluginManagerApp(Tk):
             spin = tk.Entry(server_frame, width=3, textvariable=self.concurrency_workers)
         spin.pack(side=LEFT, padx=(0, 10), pady=8)
         try:
-            Tooltip(modrinth_version_combo, "Modrinth で取得するバージョンチャンネル。\n安定版のみ/ベータ含む/アルファ含む を切り替えます。")
             Tooltip(spin, "更新確認で同時に実行するワーカー数。\n値を大きくすると処理は速くなりますが、\n同時接続が増えるため公開APIへの負荷が高まり、\nアクセス制限（ブロック）される可能性があります。\n安全な目安: 4〜8")
         except Exception:
             pass
 
         self.server_version.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.server_software.trace_add("write", lambda *args: self._schedule_server_settings_save())
-        self.modrinth_version_channel.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.concurrency_workers.trace_add("write", lambda *args: self._schedule_server_settings_save())
-        # server version/software moved to server manager; no widget to bind here
-        modrinth_version_combo.bind("<<ComboboxSelected>>", lambda event: self._schedule_server_settings_save())
 
         listing_frame = ttk.LabelFrame(outer, text="一覧から取り込み")
         listing_frame.pack(fill=X, pady=(10, 0))
@@ -1834,7 +1938,6 @@ class PluginManagerApp(Tk):
         listing_left = ttk.Frame(listing_top)
         listing_left.pack(side=LEFT, fill=X, expand=True)
         ttk.Label(listing_left, text="ls等の出力を貼り付け: ").pack(side=LEFT, padx=(0, 4))
-        ttk.Label(listing_left, text="取り込み名: manual listing").pack(side=LEFT, padx=(0, 8))
         file_from_btn = ttk.Button(listing_left, text="ファイルから読込", command=self.load_listing_file)
         file_from_btn.pack(side=LEFT, padx=(0, 8))
         import_btn = ttk.Button(listing_left, text="取り込み", command=self.import_listing_text)
@@ -1842,16 +1945,16 @@ class PluginManagerApp(Tk):
 
         add_from_url_btn = ttk.Button(listing_top, text="配布元URLでプラグインを追加", command=self._add_plugin_from_source_url)
         add_from_url_btn.pack(side=RIGHT)
-        try:
-            Tooltip(file_from_btn, "ローカルの一覧テキストから .jar 名を取り込む")
-            Tooltip(import_btn, "貼り付けた一覧から .jar をDBに登録する")
-            Tooltip(add_from_url_btn, "配布元のURLや project ref からプラグインを手動追加する")
-            Tooltip(self.listing_text, "ls 等の出力を貼り付ける領域。\nここから .jar 名を抽出して登録します。")
-        except Exception:
-            pass
+        import_tsv_btn = ttk.Button(listing_top, text="TSVから取り込み", command=self.import_plugins_from_tsv)
+        import_tsv_btn.pack(side=RIGHT, padx=(0, 8))
+        _attach_tooltip(file_from_btn, "ローカルの一覧テキストから .jar 名を取り込む")
+        _attach_tooltip(import_btn, "貼り付けた一覧から .jar をDBに登録する")
+        _attach_tooltip(import_tsv_btn, "TSV(UTF-16/UTF-8)からプラグイン一覧を取り込みます")
+        _attach_tooltip(add_from_url_btn, "配布元のURLや project ref からプラグインを手動追加する")
 
         self.listing_text = __import__("tkinter").Text(listing_frame, height=4, wrap="none")
         self.listing_text.pack(fill=X, padx=8, pady=(0, 8))
+        _attach_tooltip(self.listing_text, "ls 等の出力を貼り付ける領域。\nここから .jar 名を抽出して登録します。")
 
         progress_frame = ttk.LabelFrame(outer, text="進捗")
         progress_frame.pack(fill=X, pady=(10, 0))
@@ -1907,6 +2010,7 @@ class PluginManagerApp(Tk):
         self.tree.column("last_checked", width=160)
         self.tree.column("source", width=120)
         self.tree.pack(side=LEFT, fill=BOTH, expand=True)
+        _attach_tooltip(self.tree, "プラグイン一覧です。項目を選んで右側の操作を実行します。")
 
         list_scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
         list_scrollbar.pack(side=RIGHT, fill=Y)
@@ -1980,7 +2084,7 @@ class PluginManagerApp(Tk):
             Tooltip(change_version_btn, "選択中のプラグインの現在の版を手動で変更します")
             Tooltip(delete_btn, "選択中のプラグインを一覧から削除します")
             Tooltip(edit_url_btn, "選択中のプラグインの配布元 URL / project ref を編集します")
-            Tooltip(export_btn, "DB のプラグイン一覧をCSVで書き出します")
+            Tooltip(export_btn, "DB のプラグイン一覧をTSV(UTF-16)で書き出します")
         except Exception:
             pass
 
@@ -1992,6 +2096,7 @@ class PluginManagerApp(Tk):
         self.db_text = __import__("tkinter").Text(db_frame, height=8, wrap="none")
         self.db_text.pack(fill=BOTH, expand=True, padx=8, pady=8)
         self.db_text.configure(state="disabled")
+        _attach_tooltip(self.db_text, "データベース内容の詳細表示です。")
 
         log_frame = ttk.Frame(detail_notebook)
         detail_notebook.add(log_frame, text="ログ")
@@ -2000,6 +2105,7 @@ class PluginManagerApp(Tk):
         self.text = __import__("tkinter").Text(log_frame, height=6, wrap="word")
         self.text.pack(fill=BOTH, expand=True, padx=8, pady=8)
         self.text.configure(state="disabled")
+        _attach_tooltip(self.text, "実行ログを表示します。")
 
         main_area.add(upper_area, weight=4)
         main_area.add(detail_notebook, weight=1)
@@ -2162,13 +2268,9 @@ class PluginManagerApp(Tk):
     def _save_server_settings(self) -> None:
         version = self.server_version.get().strip()
         software = self.server_software.get().strip()
-        modrinth_channel = normalize_modrinth_version_channel(self.modrinth_version_channel.get())
-        normalized_label = modrinth_version_channel_label(modrinth_channel)
-        if self.modrinth_version_channel.get() != normalized_label:
-            self.modrinth_version_channel.set(normalized_label)
+        # Channel is managed per-server in the server manager; do not keep a global channel setting here.
         self.database.set_setting("server_version", version)
         self.database.set_setting("server_software", software)
-        self.database.set_setting("modrinth_version_channel", modrinth_channel)
         try:
             self.database.set_setting("concurrency_workers", str(int(self.concurrency_workers.get())))
         except Exception:
@@ -2189,7 +2291,6 @@ class PluginManagerApp(Tk):
                         server_version=version,
                         server_software=software,
                         plugin_folder=self.plugin_folder.get() or "",
-                        modrinth_version_channel=modrinth_channel,
                     )
                 except Exception:
                     pass
@@ -2228,7 +2329,16 @@ class PluginManagerApp(Tk):
         return self.server_version.get().strip(), self.server_software.get().strip()
 
     def _get_modrinth_version_channel(self) -> str:
-        return normalize_modrinth_version_channel(self.modrinth_version_channel.get())
+        try:
+            sid = int(self.selected_server_id.get() or 0)
+        except Exception:
+            sid = 0
+        if sid:
+            srv = self.database.get_server(sid)
+            if srv is not None:
+                return normalize_modrinth_version_channel(str(row_get(srv, "modrinth_version_channel") or "release"))
+        # fallback to release when no server selected
+        return "release"
 
     def _apply_server_row_to_ui(self, srv: sqlite3.Row | None) -> None:
         """Apply values from a server row to the main UI StringVars."""
@@ -2245,11 +2355,7 @@ class PluginManagerApp(Tk):
                 self.server_version.set(server_version)
             if server_software:
                 self.server_software.set(server_software)
-            if modrinth_channel:
-                try:
-                    self.modrinth_version_channel.set(modrinth_version_channel_label(modrinth_channel))
-                except Exception:
-                    pass
+            # modrinth channel is displayed/edited in server manager only
         except Exception:
             pass
 
@@ -2348,6 +2454,7 @@ class PluginManagerApp(Tk):
         # keep selection visible even when focus moves to form widgets
         listbox = tk.Listbox(dialog, width=36, height=12, exportselection=False)
         listbox.pack(side=LEFT, padx=(8, 0), pady=8)
+        _attach_tooltip(listbox, "登録済みサーバー一覧です。選択すると右側で編集できます。")
 
         form = ttk.Frame(dialog)
         form.pack(side=LEFT, fill=BOTH, expand=True, padx=8, pady=8)
@@ -2356,35 +2463,69 @@ class PluginManagerApp(Tk):
         name_var = StringVar()
         name_entry = ttk.Entry(form, textvariable=name_var)
         name_entry.grid(row=0, column=1, sticky="ew", pady=2)
+        _attach_tooltip(name_entry, "サーバー名を入力します。")
 
         ttk.Label(form, text="バージョン").grid(row=1, column=0, sticky="w")
         version_var = StringVar()
         version_entry = ttk.Entry(form, textvariable=version_var)
         version_entry.grid(row=1, column=1, sticky="ew", pady=2)
+        _attach_tooltip(version_entry, "対象Minecraftサーバーのバージョンを入力します。")
 
         ttk.Label(form, text="ソフト").grid(row=2, column=0, sticky="w")
         software_var = StringVar()
         software_combo = ttk.Combobox(form, textvariable=software_var, values=SERVER_SOFTWARE_OPTIONS, state="readonly")
         software_combo.grid(row=2, column=1, sticky="ew", pady=2)
+        _attach_tooltip(software_combo, "サーバーソフトを選択します。")
 
         ttk.Label(form, text="プラグインフォルダ").grid(row=3, column=0, sticky="w")
         folder_var = StringVar()
         folder_entry = ttk.Entry(form, textvariable=folder_var)
         folder_entry.grid(row=3, column=1, sticky="ew", pady=2)
+        _attach_tooltip(folder_entry, "このサーバーのプラグインフォルダを指定します。")
         def choose_folder_for_server():
             sel = filedialog.askdirectory(title="サーバーのプラグインフォルダを選択", parent=dialog)
             if sel:
                 folder_var.set(sel)
-        ttk.Button(form, text="参照", command=choose_folder_for_server).grid(row=3, column=2, padx=(6,0))
+        browse_folder_btn = ttk.Button(form, text="参照", command=choose_folder_for_server)
+        browse_folder_btn.grid(row=3, column=2, padx=(6,0))
+        _attach_tooltip(browse_folder_btn, "プラグインフォルダを選択します。")
 
         ttk.Label(form, text="Modrinth チャンネル").grid(row=4, column=0, sticky="w")
         modrinth_var = StringVar()
         modrinth_combo = ttk.Combobox(form, textvariable=modrinth_var, values=tuple(MODRINTH_VERSION_CHANNEL_LABELS.values()), state="readonly")
         modrinth_combo.grid(row=4, column=1, sticky="ew", pady=2)
+        _attach_tooltip(modrinth_combo, "更新取得時のModrinthチャンネルを選択します。")
 
         form.columnconfigure(1, weight=1)
 
         selected_index: int | None = None
+        server_ids: list[int] = []
+
+        def refresh_server_list(selected_sid: int | None = None) -> None:
+            nonlocal selected_index, server_ids
+            try:
+                listbox.delete(0, END)
+            except Exception:
+                pass
+            servers = self.database.list_servers()
+            server_ids = [int(s["id"]) for s in servers]
+            for idx, s in enumerate(servers, start=1):
+                listbox.insert(END, f"{idx}: {s['name']}")
+
+            if selected_sid and selected_sid in server_ids:
+                selected_index = server_ids.index(selected_sid)
+            elif server_ids:
+                selected_index = 0
+            else:
+                selected_index = None
+
+            try:
+                if selected_index is not None:
+                    listbox.selection_set(selected_index)
+                    listbox.activate(selected_index)
+                    listbox.see(selected_index)
+            except Exception:
+                pass
 
         def load_server_into_form(sid: int) -> None:
             srv = self.database.get_server(sid)
@@ -2406,8 +2547,10 @@ class PluginManagerApp(Tk):
                 except Exception:
                     pass
                 return
-            text = listbox.get(sel[0])
-            sid = int(text.split(":", 1)[0])
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(server_ids):
+                return
+            sid = server_ids[idx]
             load_server_into_form(sid)
             try:
                 save_btn.config(text="保存")
@@ -2415,26 +2558,17 @@ class PluginManagerApp(Tk):
             except Exception:
                 pass
             try:
-                selected_index = sel[0]
+                selected_index = idx
             except Exception:
                 selected_index = None
 
-        servers = self.database.list_servers()
-        for s in servers:
-            listbox.insert(END, f"{s['id']}: {s['name']}")
+        refresh_server_list()
         listbox.bind("<<ListboxSelect>>", on_list_select)
         # select the first server by default when opening the manager
         try:
             if listbox.size() > 0:
-                listbox.selection_set(0)
-                listbox.activate(0)
-                listbox.see(0)
                 selected_index = 0
-                # trigger load into form
-                try:
-                    on_list_select()
-                except Exception:
-                    pass
+                on_list_select()
         except Exception:
             pass
 
@@ -2491,19 +2625,18 @@ class PluginManagerApp(Tk):
             folder = folder_var.get().strip()
             modch = normalize_modrinth_version_channel(modrinth_var.get())
             if sel:
-                text = listbox.get(sel[0])
-                sid = int(text.split(":", 1)[0])
+                idx = int(sel[0])
+                if idx < 0 or idx >= len(server_ids):
+                    return
+                sid = server_ids[idx]
                 try:
                     self.database.update_server(sid, name=name, server_version=version, server_software=software, plugin_folder=folder, modrinth_version_channel=modch)
-                    listbox.delete(sel[0])
-                    listbox.insert(sel[0], f"{sid}: {name}")
                 except sqlite3.IntegrityError:
                     messagebox.showerror("更新失敗", "同名のサーバーが既に存在します。別の名前を指定してください。", parent=dialog)
                     return
             else:
                 try:
                     sid = self.database.create_server(name=name, server_version=version, server_software=software, plugin_folder=folder, modrinth_version_channel=modch)
-                    listbox.insert(END, f"{sid}: {name}")
                     try:
                         new_btn.config(state="normal")
                     except Exception:
@@ -2535,24 +2668,23 @@ class PluginManagerApp(Tk):
                 if folder is not None:
                     self.plugin_folder.set(folder)
                 try:
-                    self.modrinth_version_channel.set(modrinth_version_channel_label(modch))
-                except Exception:
-                    pass
-                try:
                     # persist these settings and update server row if needed
                     self._schedule_server_settings_save()
                 except Exception:
                     pass
             except Exception:
                 pass
+            refresh_server_list(sid)
             self._load_servers_to_ui()
 
         def delete_server():
             sel = listbox.curselection()
             if not sel:
                 return
-            text = listbox.get(sel[0])
-            sid = int(text.split(":", 1)[0])
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(server_ids):
+                return
+            sid = server_ids[idx]
             if not messagebox.askyesno("削除確認", "このサーバーを削除しますか?", parent=dialog):
                 return
             try:
@@ -2560,13 +2692,19 @@ class PluginManagerApp(Tk):
             except Exception as exc:
                 messagebox.showerror("削除失敗", str(exc), parent=dialog)
                 return
-            listbox.delete(sel[0])
             try:
-                if listbox.size() == 0:
+                if len(server_ids) <= 1:
                     new_btn.config(state="disabled")
             except Exception:
                 pass
-            new_server()
+            refresh_server_list()
+            if server_ids:
+                try:
+                    on_list_select()
+                except Exception:
+                    pass
+            else:
+                new_server()
 
         # Buttons: stack vertically at the right side
         btn_frame = ttk.Frame(dialog)
@@ -2579,6 +2717,10 @@ class PluginManagerApp(Tk):
         del_btn.pack(side="top", pady=4, padx=4, fill=X)
         close_btn = ttk.Button(btn_frame, text="閉じる", command=dialog.destroy)
         close_btn.pack(side="top", pady=4, padx=4, fill=X)
+        _attach_tooltip(new_btn, "フォームをクリアして新規サーバー入力モードにします。")
+        _attach_tooltip(save_btn, "入力内容を保存します。未選択時は新規追加、選択時は更新します。")
+        _attach_tooltip(del_btn, "選択中のサーバーを削除します。")
+        _attach_tooltip(close_btn, "サーバー管理を閉じます。")
         try:
             del_btn.config(state="disabled")
         except Exception:
@@ -2703,8 +2845,9 @@ class PluginManagerApp(Tk):
         )
         self.reload_tree()
 
-    def _apply_manual_match_url(self, row: sqlite3.Row, source_value: str) -> bool:
+    def _apply_manual_match_url(self, row: sqlite3.Row, source_value: str) -> tuple[bool, str]:
         source_value = (source_value or "").strip()
+        file_path = str(row_get(row, "file_path") or "")
         preferred_type = normalize_source_type(row_get(row, "source_type"))
         value_lower = source_value.lower()
         source_type = ""
@@ -2798,15 +2941,14 @@ class PluginManagerApp(Tk):
             except Exception:
                 project_title = project_title or github_ref
         else:
-            messagebox.showwarning("URL無効", "Modrinth / Hangar / GitHub / SpigotMC の project URL または project ref を入力してください。")
-            return False
+            return False, "Modrinth / Hangar / GitHub / SpigotMC の project URL または project ref を入力してください。"
 
         if not file_path:
-            return False
+            return False, "対象プラグインのファイルパスが取得できませんでした。"
 
         conn = self.database.server_connection
         if not conn:
-            return False
+            return False, "サーバーが選択されていません。"
 
         with conn:
             conn.execute(
@@ -2827,7 +2969,7 @@ class PluginManagerApp(Tk):
 
         self._log(f"URLを設定しました: {row_get(row, 'plugin_name')} -> {project_title}")
         self._refresh_match_for_file(file_path)
-        return True
+        return True, f"{row_get(row, 'plugin_name')} -> {project_title}"
 
     def _show_failed_match_dialog(self, failed_rows: list[sqlite3.Row]) -> None:
         if not failed_rows:
@@ -2898,6 +3040,7 @@ class PluginManagerApp(Tk):
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         scrollbar.pack(side=RIGHT, fill=Y)
         tree.configure(yscrollcommand=scrollbar.set)
+        _attach_tooltip(tree, "自動マッチに失敗した項目一覧です。対象を選んでURLを設定できます。")
 
         def current_row() -> sqlite3.Row | None:
             selection = tree.selection()
@@ -2916,12 +3059,16 @@ class PluginManagerApp(Tk):
             value = self._prompt_modrinth_url(row, "マッチ先URLを入力")
             if value is None:
                 return
-            if self._apply_manual_match_url(row, value):
+            ok, result_message = self._apply_manual_match_url(row, value)
+            if ok:
+                messagebox.showinfo("手動マッチング成功", result_message, parent=dialog)
                 remaining_failed_rows = refresh_failed_list(select_first=True)
                 if not remaining_failed_rows:
                     dialog.destroy()
                     return
                 self._log(f"まだ {len(remaining_failed_rows)} 件のマッチング失敗が残っています。")
+            else:
+                messagebox.showerror("手動マッチング失敗", result_message, parent=dialog)
 
         def skip_item() -> None:
             row = current_row()
@@ -2958,11 +3105,21 @@ class PluginManagerApp(Tk):
         def close_dialog() -> None:
             dialog.destroy()
 
-        ttk.Button(actions, text="URLを追加/変更", command=add_or_change_url).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(actions, text="スキップ", command=skip_item).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(actions, text="Modrinthで検索", command=search_modrinth).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(actions, text="Googleで検索", command=search_google).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(actions, text="閉じる", command=close_dialog).pack(side=RIGHT)
+        add_url_btn = ttk.Button(actions, text="URLを追加/変更", command=add_or_change_url)
+        add_url_btn.pack(side=LEFT, padx=(0, 6))
+        skip_btn = ttk.Button(actions, text="スキップ", command=skip_item)
+        skip_btn.pack(side=LEFT, padx=(0, 6))
+        modrinth_search_btn = ttk.Button(actions, text="Modrinthで検索", command=search_modrinth)
+        modrinth_search_btn.pack(side=LEFT, padx=(0, 6))
+        google_search_btn = ttk.Button(actions, text="Googleで検索", command=search_google)
+        google_search_btn.pack(side=LEFT, padx=(0, 6))
+        close_btn = ttk.Button(actions, text="閉じる", command=close_dialog)
+        close_btn.pack(side=RIGHT)
+        _attach_tooltip(add_url_btn, "選択中プラグインの取得元URLを追加または変更します。")
+        _attach_tooltip(skip_btn, "選択中プラグインのマッチングを今回はスキップします。")
+        _attach_tooltip(modrinth_search_btn, "選択中プラグイン名でModrinth検索を開きます。")
+        _attach_tooltip(google_search_btn, "選択中プラグイン名でGoogle検索を開きます。")
+        _attach_tooltip(close_btn, "このダイアログを閉じます。")
 
         def on_double_click(event=None):
             add_or_change_url()
@@ -3071,7 +3228,9 @@ class PluginManagerApp(Tk):
             messagebox.showerror("追加失敗", "新規プラグインの登録に失敗しました。")
             return
 
-        if not self._apply_manual_match_url(row, source_value):
+        ok, result_message = self._apply_manual_match_url(row, source_value)
+        if not ok:
+            messagebox.showerror("手動マッチング失敗", result_message)
             self.database.delete_plugin_by_path(file_path)
             self.reload_tree()
             return
@@ -3110,6 +3269,7 @@ class PluginManagerApp(Tk):
 
         self.reload_tree()
         self._log(f"配布元URLで追加しました: {source_value}")
+        messagebox.showinfo("手動マッチング成功", result_message)
 
     def _edit_selected_source_url(self) -> None:
         row = self._selected_row_or_warn()
@@ -3126,8 +3286,11 @@ class PluginManagerApp(Tk):
         if new_value is None:
             return
 
-        if not self._apply_manual_match_url(row, new_value):
+        ok, result_message = self._apply_manual_match_url(row, new_value)
+        if not ok:
+            messagebox.showerror("手動マッチング失敗", result_message)
             return
+        messagebox.showinfo("手動マッチング成功", result_message)
 
     def show_failed_matches(self) -> None:
         failed_rows = self._failed_match_rows()
@@ -3161,16 +3324,17 @@ class PluginManagerApp(Tk):
 
         destination = filedialog.asksaveasfilename(
             title="エクスポート先を選択",
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            defaultextension=".tsv",
+            filetypes=[("TSV files", "*.tsv"), ("All files", "*.*")],
         )
         if not destination:
             return
 
         try:
-            with open(destination, "w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(["プラグイン名", "現在の版", "最新", "最終確認", "取得元", "ファイル名", "ファイルパス", "エラー"])
+            # UTF-16 + tab-separated values is reliably readable by Excel on Japanese Windows.
+            with open(destination, "w", newline="", encoding="utf-16") as handle:
+                writer = csv.writer(handle, delimiter="\t")
+                writer.writerow(["プラグイン名", "現在の版", "最新", "最終確認", "取得元", "取得元URL", "ファイル名", "ファイルパス", "エラー"])
                 for row in rows:
                     writer.writerow([
                         row_get(row, "plugin_name", ""),
@@ -3178,6 +3342,7 @@ class PluginManagerApp(Tk):
                         row_get(row, "latest_version", ""),
                         row_get(row, "last_checked", ""),
                         format_source_label(row_get(row, "source_type"), row_get(row, "source_title"), row_get(row, "source_id")),
+                        build_source_url(row_get(row, "source_type"), row_get(row, "source_id")),
                         row_get(row, "file_name", ""),
                         row_get(row, "file_path", ""),
                         row_get(row, "last_error", ""),
@@ -3198,7 +3363,9 @@ class PluginManagerApp(Tk):
 
         target_version = StringVar(value=str(row_get(row, "current_version") or ""))
         ttk.Label(dialog, text="新しいバージョンを入力してください:").pack(fill=X, padx=10, pady=(10, 4))
-        ttk.Entry(dialog, textvariable=target_version).pack(fill=X, padx=10, pady=(0, 10))
+        version_entry = ttk.Entry(dialog, textvariable=target_version)
+        version_entry.pack(fill=X, padx=10, pady=(0, 10))
+        _attach_tooltip(version_entry, "設定するバージョン文字列を入力します。")
 
         def apply_version() -> None:
             new_version = target_version.get().strip()
@@ -3221,8 +3388,12 @@ class PluginManagerApp(Tk):
 
         btns = ttk.Frame(dialog)
         btns.pack(fill=X, padx=10, pady=(0, 10))
-        ttk.Button(btns, text="適用", command=apply_version).pack(side=RIGHT)
-        ttk.Button(btns, text="キャンセル", command=dialog.destroy).pack(side=RIGHT, padx=(0, 8))
+        apply_btn = ttk.Button(btns, text="適用", command=apply_version)
+        apply_btn.pack(side=RIGHT)
+        cancel_btn = ttk.Button(btns, text="キャンセル", command=dialog.destroy)
+        cancel_btn.pack(side=RIGHT, padx=(0, 8))
+        _attach_tooltip(apply_btn, "入力したバージョンを選択中プラグインに適用します。")
+        _attach_tooltip(cancel_btn, "変更せずに閉じます。")
 
     def _open_file_location(self) -> None:
         row = self._selected_row_or_warn()
@@ -3330,7 +3501,7 @@ class PluginManagerApp(Tk):
     def load_listing_file(self) -> None:
         file_path = filedialog.askopenfilename(
             title="一覧テキストを選択",
-            filetypes=[("Text files", "*.txt;*.log;*.csv"), ("All files", "*.*")],
+            filetypes=[("Text files", "*.txt;*.log;*.csv;*.tsv"), ("All files", "*.*")],
         )
         if not file_path:
             return
@@ -3339,6 +3510,100 @@ class PluginManagerApp(Tk):
         self.listing_text.delete("1.0", END)
         self.listing_text.insert("1.0", text)
         self._log(f"一覧ファイルを読み込みました: {file_path}")
+
+    def import_plugins_from_tsv(self) -> None:
+        if not self.database.server_connection:
+            messagebox.showwarning("サーバー未選択", "サーバーが選択されていません。\n(サーバー管理から追加・選択してください)")
+            return
+
+        file_path = filedialog.askopenfilename(
+            title="TSVファイルを選択",
+            filetypes=[("TSV files", "*.tsv"), ("Text files", "*.txt;*.log;*.csv"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        text = None
+        for enc in ("utf-16", "utf-8-sig", "utf-8"):
+            try:
+                text = Path(file_path).read_text(encoding=enc, errors="strict")
+                break
+            except Exception:
+                continue
+        if text is None:
+            messagebox.showerror("取り込み失敗", "TSVの文字コードを判別できませんでした。")
+            return
+
+        try:
+            reader = csv.DictReader(text.splitlines(), delimiter="\t")
+            rows = list(reader)
+        except Exception as exc:
+            messagebox.showerror("取り込み失敗", f"TSVの解析に失敗しました: {exc}")
+            return
+
+        if not rows:
+            messagebox.showinfo("対象なし", "TSVに取り込めるデータがありません。")
+            return
+
+        entries: list[PluginEntry] = []
+        source_urls: list[tuple[str, str]] = []
+        skipped = 0
+
+        for row in rows:
+            plugin_name = str(row.get("プラグイン名") or "").strip()
+            current_version = str(row.get("現在の版") or "").strip()
+            file_name = str(row.get("ファイル名") or "").strip()
+            file_path_value = str(row.get("ファイルパス") or "").strip()
+            source_url = str(row.get("取得元URL") or "").strip()
+
+            if not plugin_name and not file_name and not file_path_value:
+                skipped += 1
+                continue
+
+            if not file_name:
+                file_name = f"{safe_filename(plugin_name or 'plugin')}.jar"
+            if not file_path_value:
+                digest = hashlib.sha1(f"{plugin_name}|{file_name}|{source_url}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+                file_path_value = f"imported://{safe_filename(file_name)}-{digest}"
+
+            entries.append(
+                PluginEntry(
+                    plugin_name=plugin_name or Path(file_name).stem,
+                    current_version=current_version,
+                    file_name=file_name,
+                    file_path=file_path_value,
+                )
+            )
+            if source_url:
+                source_urls.append((file_path_value, source_url))
+
+        if not entries:
+            messagebox.showinfo("対象なし", "TSVに取り込める行がありません。")
+            return
+
+        self.database.upsert_local_plugins(entries)
+
+        matched = 0
+        failed = 0
+        for fp, src in source_urls:
+            target = self.database.get_plugin_by_path(fp)
+            if target is None:
+                failed += 1
+                continue
+            ok, _msg = self._apply_manual_match_url(target, src)
+            if ok:
+                matched += 1
+            else:
+                failed += 1
+
+        self.reload_tree()
+        summary = f"TSVから {len(entries)} 件取り込みました"
+        if skipped:
+            summary += f"（空行スキップ {skipped} 件）"
+        if source_urls:
+            summary += f"\n取得元URL適用: 成功 {matched} 件 / 失敗 {failed} 件"
+        self._log(summary)
+        messagebox.showinfo("取り込み完了", summary)
 
     def import_listing_text(self) -> None:
         if not self.database.server_connection:
@@ -3505,6 +3770,7 @@ class PluginManagerApp(Tk):
                     server_version=server_version,
                     server_software=server_software,
                     version_channel=self._get_modrinth_version_channel(),
+                    source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                 )
                 if not release:
                     raise RuntimeError(
@@ -3596,6 +3862,7 @@ class PluginManagerApp(Tk):
                             server_version=server_version,
                             server_software=server_software,
                             version_channel=self._get_modrinth_version_channel(),
+                            source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                         )
                     if not release:
                         raise RuntimeError(
@@ -3791,6 +4058,7 @@ class PluginManagerApp(Tk):
         vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
         vsb.pack(side=RIGHT, fill=Y)
         tree.configure(yscrollcommand=vsb.set)
+        _attach_tooltip(tree, "ダウンロード対象一覧です。左端のチェックで対象を切り替えます。")
 
         # track selection state in a map: item_id -> bool
         item_map: dict[str, dict] = {}
@@ -3850,8 +4118,12 @@ class PluginManagerApp(Tk):
 
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(fill=X, pady=(8, 4))
-        ttk.Button(btn_frame, text="すべて選択", command=select_all).pack(side=LEFT, padx=6)
-        ttk.Button(btn_frame, text="すべて解除", command=deselect_all).pack(side=LEFT, padx=6)
+        select_all_btn = ttk.Button(btn_frame, text="すべて選択", command=select_all)
+        select_all_btn.pack(side=LEFT, padx=6)
+        deselect_all_btn = ttk.Button(btn_frame, text="すべて解除", command=deselect_all)
+        deselect_all_btn.pack(side=LEFT, padx=6)
+        _attach_tooltip(select_all_btn, "一覧の全項目をダウンロード対象にします。")
+        _attach_tooltip(deselect_all_btn, "一覧の全項目をダウンロード対象から外します。")
         def open_source_for_selected():
             iid = tree.focus()
             if not iid:
@@ -3953,8 +4225,12 @@ class PluginManagerApp(Tk):
             result = None
             dialog.destroy()
 
-        ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=RIGHT, padx=6)
-        ttk.Button(btn_frame, text="キャンセル", command=on_cancel).pack(side=RIGHT)
+        ok_btn = ttk.Button(btn_frame, text="OK", command=on_ok)
+        ok_btn.pack(side=RIGHT, padx=6)
+        cancel_btn = ttk.Button(btn_frame, text="キャンセル", command=on_cancel)
+        cancel_btn.pack(side=RIGHT)
+        _attach_tooltip(ok_btn, "チェックされた項目でダウンロードを続行します。")
+        _attach_tooltip(cancel_btn, "ダウンロード選択を取り消して閉じます。")
 
         # wait for the dialog to close
         self.wait_window(dialog)
