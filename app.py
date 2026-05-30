@@ -1778,6 +1778,12 @@ class PluginManagerApp(Tk):
         self.minsize(1060, 640)
 
         self.database = PluginDatabase(DB_PATH)
+        # selected server id (0 == global)
+        try:
+            sel = int(self.database.get_setting("selected_server_id", "0") or "0")
+        except Exception:
+            sel = 0
+        self.selected_server_id = tk.IntVar(value=sel)
         self.plugin_folder = StringVar(value=self.database.get_setting("plugin_folder", ""))
         self.server_version = StringVar(value=self.database.get_setting("server_version", ""))
         self.server_software = StringVar(value=self.database.get_setting("server_software", ""))
@@ -2153,12 +2159,6 @@ class PluginManagerApp(Tk):
                 except Exception:
                     pass
 
-            def copy() -> None:
-                try:
-                    widget.event_generate("<<Copy>>")
-                except Exception:
-                    pass
-
             def paste() -> None:
                 if widget_class != "Text" and str(widget.cget("state")) == "readonly":
                     return
@@ -2367,29 +2367,64 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
+    def _sync_selected_server(self, target_sid: int | None, reload_tree: bool = False) -> None:
+        """Synchronize the selected server id, combo display, opened DB, and main UI fields."""
+        try:
+            sid = int(target_sid or 0)
+        except Exception:
+            sid = 0
+
+        if sid <= 0 or sid not in self._server_id_list:
+            try:
+                self.selected_server_id.set(0)
+                self.database.set_setting("selected_server_id", "")
+                self._server_combo_var.set("")
+            except Exception:
+                pass
+            try:
+                self.database.open_server_db(0)
+            except Exception:
+                pass
+            try:
+                self._apply_server_row_to_ui(None)
+            except Exception:
+                pass
+            if reload_tree:
+                try:
+                    self.reload_tree()
+                except Exception:
+                    pass
+            return
+
+        idx = self._server_id_list.index(sid)
+        try:
+            self._server_combo_var.set(self._server_name_list[idx])
+        except Exception:
+            pass
+        try:
+            self.selected_server_id.set(sid)
+            self.database.set_setting("selected_server_id", str(sid))
+        except Exception:
+            pass
+        try:
+            self.database.open_server_db(int(sid))
+        except Exception:
+            pass
+        try:
+            srv = self.database.get_server(sid)
+            self._apply_server_row_to_ui(srv)
+        except Exception:
+            pass
+        if reload_tree:
+            try:
+                self.reload_tree()
+            except Exception:
+                pass
+
     def _select_server_by_id(self, target_sid: int | None, reload_tree: bool = False) -> None:
         """Select a server by id and sync DB/UI state if the id exists."""
         try:
-            if target_sid and target_sid in self._server_id_list:
-                idx = self._server_id_list.index(target_sid)
-                self._server_combo_var.set(self._server_name_list[idx])
-                self.selected_server_id.set(target_sid)
-                self.database.set_setting("selected_server_id", str(target_sid))
-                try:
-                    self.database.open_server_db(int(target_sid))
-                except Exception:
-                    pass
-                try:
-                    srv = self.database.get_server(target_sid)
-                    if srv:
-                        self._apply_server_row_to_ui(srv)
-                except Exception:
-                    pass
-                if reload_tree:
-                    try:
-                        self.reload_tree()
-                    except Exception:
-                        pass
+            self._sync_selected_server(target_sid, reload_tree=reload_tree)
         except Exception:
             pass
 
@@ -2427,10 +2462,10 @@ class PluginManagerApp(Tk):
             sid = 0
 
         if sid and sid in self._server_id_list:
-            self._select_server_by_id(sid)
+            self._sync_selected_server(sid)
         else:
             if self._server_name_list:
-                self._select_server_by_id(self._server_id_list[0])
+                self._sync_selected_server(self._server_id_list[0])
         # Refresh plugin list once after switching active server context.
         try:
             self.reload_tree()
@@ -2442,7 +2477,7 @@ class PluginManagerApp(Tk):
         if name and name in self._server_name_list:
             idx = self._server_name_list.index(name)
             sid = self._server_id_list[idx]
-            self._select_server_by_id(sid, reload_tree=True)
+            self._sync_selected_server(sid, reload_tree=True)
 
     def _open_server_manager(self) -> None:
         dialog = tk.Toplevel(self)
@@ -2647,15 +2682,7 @@ class PluginManagerApp(Tk):
             # ensure the saved/created server becomes the selected server in main UI
             try:
                 self.database.set_setting("selected_server_id", str(sid))
-                # use centralized selection logic to open server DB, apply row to UI and reload
-                try:
-                    self._select_server_by_id(sid, reload_tree=True)
-                except Exception:
-                    # best-effort: fall back to explicit open
-                    try:
-                        self.database.open_server_db(int(sid))
-                    except Exception:
-                        pass
+                self._sync_selected_server(sid, reload_tree=True)
             except Exception:
                 pass
             # Immediately update main UI variables so changes are visible
@@ -2675,7 +2702,10 @@ class PluginManagerApp(Tk):
             except Exception:
                 pass
             refresh_server_list(sid)
-            self._load_servers_to_ui()
+            try:
+                self._sync_selected_server(sid, reload_tree=True)
+            except Exception:
+                pass
 
         def delete_server():
             sel = listbox.curselection()
