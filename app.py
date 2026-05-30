@@ -1029,6 +1029,22 @@ class PluginDatabase:
     _logger = logging.getLogger("minecraft_plugin_autoupdate_checker.db")
     logging.basicConfig(level=logging.INFO)
 
+
+def _safe_log(logger: logging.Logger | None, level: int, msg: str, *args) -> None:
+    try:
+        if logger:
+            logger.log(level, msg, *args)
+    except Exception:
+        pass
+
+
+def _safe_debug(logger: logging.Logger | None, msg: str, *args) -> None:
+    _safe_log(logger, logging.DEBUG, msg, *args)
+
+
+def _safe_info(logger: logging.Logger | None, msg: str, *args) -> None:
+    _safe_log(logger, logging.INFO, msg, *args)
+
     def open_server_db(self, server_id: int) -> None:
         """Open (or create) the per-server sqlite DB for the given server id.
         This will initialize the plugins schema in that DB and move any matching rows
@@ -1135,11 +1151,8 @@ class PluginDatabase:
                         """,
                         (entry.plugin_name, entry.current_version, entry.file_name, created_at, entry.file_path),
                     )
-                    try:
-                        updated += 1
-                        self._logger.debug("upsert_local_plugins: updated %s", entry.file_path)
-                    except Exception:
-                        pass
+                    updated += 1
+                    _safe_debug(self._logger, "upsert_local_plugins: updated %s", entry.file_path)
                 else:
                     # include server_id when inserting into a server DB
                     if self.current_server_id:
@@ -1162,11 +1175,8 @@ class PluginDatabase:
                                 created_at,
                             ),
                         )
-                        try:
-                            inserted += 1
-                            self._logger.debug("upsert_local_plugins: inserted %s", entry.file_path)
-                        except Exception:
-                            pass
+                        inserted += 1
+                        _safe_debug(self._logger, "upsert_local_plugins: inserted %s", entry.file_path)
                     else:
                         conn.execute(
                             """
@@ -1186,15 +1196,9 @@ class PluginDatabase:
                                 created_at,
                             ),
                         )
-                        try:
-                            inserted += 1
-                            self._logger.debug("upsert_local_plugins: inserted %s", entry.file_path)
-                        except Exception:
-                            pass
-        try:
-            self._logger.info("upsert_local_plugins: inserted=%s updated=%s total=%s", inserted, updated, len(entries))
-        except Exception:
-            pass
+                        inserted += 1
+                        _safe_debug(self._logger, "upsert_local_plugins: inserted %s", entry.file_path)
+        _safe_info(self._logger, "upsert_local_plugins: inserted=%s updated=%s total=%s", inserted, updated, len(entries))
 
     def upsert_imported_jars(self, jar_names: list[str], source_label: str = "manual listing") -> int:
         conn = self.server_connection
@@ -1213,10 +1217,7 @@ class PluginDatabase:
             )
 
         self.upsert_local_plugins(entries)
-        try:
-            self._logger.info("upsert_imported_jars: imported=%s", len(entries))
-        except Exception:
-            pass
+        _safe_info(self._logger, "upsert_imported_jars: imported=%s", len(entries))
         return len(entries)
 
     def _deduplicate_listing_plugins(self) -> None:
@@ -1314,10 +1315,7 @@ class PluginDatabase:
                 (name, server_version, server_software, plugin_folder, modrinth_version_channel, now, now),
             )
             server_id = int(cur.lastrowid)
-            try:
-                self._logger.debug("create_server: id=%s name=%s version=%s software=%s folder=%s", server_id, name, server_version, server_software, plugin_folder)
-            except Exception:
-                pass
+            _safe_debug(self._logger, "create_server: id=%s name=%s version=%s software=%s folder=%s", server_id, name, server_version, server_software, plugin_folder)
             return server_id
 
     def get_server(self, server_id: int) -> sqlite3.Row | None:
@@ -1346,10 +1344,7 @@ class PluginDatabase:
                 "UPDATE servers SET name = ?, server_version = ?, server_software = ?, plugin_folder = ?, modrinth_version_channel = ?, updated_at = ? WHERE id = ?",
                 (name, server_version, server_software, plugin_folder, modrinth_version_channel, now, server_id),
             )
-            try:
-                self._logger.debug("update_server: id=%s name=%s version=%s software=%s folder=%s", server_id, name, server_version, server_software, plugin_folder)
-            except Exception:
-                pass
+            _safe_debug(self._logger, "update_server: id=%s name=%s version=%s software=%s folder=%s", server_id, name, server_version, server_software, plugin_folder)
 
     def delete_server(self, server_id: int) -> None:
         # attempt to remove associated server DB file if present
@@ -1383,10 +1378,7 @@ class PluginDatabase:
 
         with self.connection:
             self.connection.execute("DELETE FROM servers WHERE id = ?", (server_id,))
-            try:
-                self._logger.debug("delete_server: id=%s", server_id)
-            except Exception:
-                pass
+            _safe_debug(self._logger, "delete_server: id=%s", server_id)
 
     def update_plugin_remote(
         self,
@@ -1427,10 +1419,7 @@ class PluginDatabase:
                     file_path,
                 ),
             )
-        try:
-            self._logger.debug("update_plugin_remote: %s -> %s", file_path, latest_version)
-        except Exception:
-            pass
+        _safe_debug(self._logger, "update_plugin_remote: %s -> %s", file_path, latest_version)
 
     def get_plugin_by_path(self, file_path: str) -> sqlite3.Row | None:
         conn = self.server_connection
@@ -1444,10 +1433,7 @@ class PluginDatabase:
             return
         with conn:
             conn.execute("DELETE FROM plugins WHERE file_path = ?", (file_path,))
-        try:
-            self._logger.debug("delete_plugin_by_path: %s", file_path)
-        except Exception:
-            pass
+        _safe_debug(self._logger, "delete_plugin_by_path: %s", file_path)
 
 class IconManager:
     def __init__(self, app: "PluginManagerApp") -> None:
