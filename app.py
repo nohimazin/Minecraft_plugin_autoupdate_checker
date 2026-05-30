@@ -888,6 +888,22 @@ class ImportedJarEntry:
     file_path: str
 
 
+def _safe_log(logger: logging.Logger | None, level: int, msg: str, *args) -> None:
+    try:
+        if logger:
+            logger.log(level, msg, *args)
+    except Exception:
+        pass
+
+
+def _safe_debug(logger: logging.Logger | None, msg: str, *args) -> None:
+    _safe_log(logger, logging.DEBUG, msg, *args)
+
+
+def _safe_info(logger: logging.Logger | None, msg: str, *args) -> None:
+    _safe_log(logger, logging.INFO, msg, *args)
+
+
 class PluginDatabase:
     def __init__(self, db_path: Path) -> None:
         APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -1028,22 +1044,7 @@ class PluginDatabase:
     # lightweight logger for DB operations
     _logger = logging.getLogger("minecraft_plugin_autoupdate_checker.db")
     logging.basicConfig(level=logging.INFO)
-
-
-def _safe_log(logger: logging.Logger | None, level: int, msg: str, *args) -> None:
-    try:
-        if logger:
-            logger.log(level, msg, *args)
-    except Exception:
-        pass
-
-
-def _safe_debug(logger: logging.Logger | None, msg: str, *args) -> None:
-    _safe_log(logger, logging.DEBUG, msg, *args)
-
-
-def _safe_info(logger: logging.Logger | None, msg: str, *args) -> None:
-    _safe_log(logger, logging.INFO, msg, *args)
+    
 
     def open_server_db(self, server_id: int) -> None:
         """Open (or create) the per-server sqlite DB for the given server id.
@@ -2512,12 +2513,16 @@ class PluginManagerApp(Tk):
                     return
             # ensure the saved/created server becomes the selected server in main UI
             try:
-                self.selected_server_id.set(sid)
                 self.database.set_setting("selected_server_id", str(sid))
+                # use centralized selection logic to open server DB, apply row to UI and reload
                 try:
-                    self.database.open_server_db(int(sid))
+                    self._select_server_by_id(sid, reload_tree=True)
                 except Exception:
-                    pass
+                    # best-effort: fall back to explicit open
+                    try:
+                        self.database.open_server_db(int(sid))
+                    except Exception:
+                        pass
             except Exception:
                 pass
             # Immediately update main UI variables so changes are visible
