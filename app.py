@@ -307,24 +307,23 @@ def extract_jar_names_from_listing(listing_text: str) -> list[str]:
         if line.startswith("total "):
             continue
 
-        candidate = line
+        candidates: list[str] = []
         if re.match(r"^[bcdlps-][rwx-]{9}\s", line):
             parts = line.split(maxsplit=8)
             if len(parts) >= 9:
-                candidate = parts[8]
+                candidates.append(parts[8])
         else:
-            tail_match = re.search(r"(?P<name>[^\r\n]+?\.jar)\s*$", line, re.IGNORECASE)
-            if tail_match:
-                candidate = tail_match.group("name")
+            # ls output can be column-aligned; a single line may contain multiple file names.
+            # Collect every .jar token on the line instead of only the trailing one.
+            candidates.extend(re.findall(r"(?<!\S)([^\s]+?\.jar)(?=\s|$)", line, re.IGNORECASE))
 
-        candidate = Path(candidate.rstrip("/")).name
-
-        if not candidate.lower().endswith(".jar"):
-            continue
-
-        if candidate not in seen:
-            seen.add(candidate)
-            jar_names.append(candidate)
+        for candidate in candidates:
+            candidate = Path(candidate.rstrip("/")).name
+            if not candidate.lower().endswith(".jar"):
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                jar_names.append(candidate)
 
     return jar_names
 
@@ -471,7 +470,53 @@ def modrinth_version_channel_label(value: str) -> str:
     return MODRINTH_VERSION_CHANNEL_LABELS.get(channel, MODRINTH_VERSION_CHANNEL_LABELS["release"])
 
 
-def get_modrinth_release(project_id: str, server_version: str = "", server_software: str = "", version_channel: str = "release") -> dict | None:
+def _modrinth_is_plugin_loader_version(item: dict) -> bool:
+    loaders = {str(loader).lower() for loader in (item.get("loaders") or []) if str(loader).strip()}
+    if not loaders:
+        return True
+    plugin_loaders = {"bukkit", "paper", "spigot", "purpur", "folia", "velocity", "waterfall", "bungeecord"}
+    fabric_like_loaders = {"fabric", "quilt", "forge", "neoforge", "liteloader"}
+    if loaders & plugin_loaders:
+        return True
+    if loaders & fabric_like_loaders:
+        return False
+    return True
+
+
+def _modrinth_loader_hints_from_text(text: str) -> list[str]:
+    lowered = (text or "").lower()
+    hints: list[str] = []
+    mapping = {
+        "bukkit": ("bukkit",),
+        "paper": ("paper",),
+        "spigot": ("spigot",),
+        "purpur": ("purpur",),
+        "folia": ("folia",),
+        "velocity": ("velocity",),
+        "waterfall": ("waterfall",),
+        "bungeecord": ("bungeecord", "bungee"),
+        "fabric": ("fabric",),
+        "quilt": ("quilt",),
+        "forge": ("forge",),
+        "neoforge": ("neoforge",),
+    }
+    for loader, tokens in mapping.items():
+        if any(token in lowered for token in tokens) and loader not in hints:
+            hints.append(loader)
+    return hints
+
+
+def _best_loader_rank(item_loaders: list[str], preferred_loaders: list[str]) -> int:
+    if not preferred_loaders:
+        return 0
+    loader_set = {str(loader).lower() for loader in item_loaders if str(loader).strip()}
+    for index, loader in enumerate(preferred_loaders):
+        if loader in loader_set:
+            return index
+    return len(preferred_loaders)
+
+
+def get_modrinth_release(project_id: str, server_version: str = "", server_software: str = "", version_channel: str = "release", source_title: str = "") -> dict | None:
     versions = http_json(MODRINTH_VERSIONS_URL.format(project_id=project_id))
     if not versions:
         return None
@@ -483,6 +528,9 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
 
     target_version = (server_version or "").strip()
     target_loaders = loader_candidates_for_software(server_software)
+    inferred_loaders = _modrinth_loader_hints_from_text(source_title)
+    if not target_loaders and inferred_loaders:
+        target_loaders = list(inferred_loaders)
 
     def version_matches(item: dict) -> bool:
         item_loaders = [str(loader).lower() for loader in (item.get("loaders") or [])]
@@ -497,12 +545,19 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
     matched_versions = [item for item in versions if version_matches(item)]
     if not matched_versions and not target_version and target_loaders:
         matched_versions = [item for item in versions if any(loader in target_loaders for loader in [str(x).lower() for x in (item.get("loaders") or [])])]
-    if not matched_versions and not target_version and not target_loaders:
-        matched_versions = versions
+    if not matched_versions and not target_loaders:
+        plugin_pref_versions = [item for item in versions if _modrinth_is_plugin_loader_version(item)]
+        matched_versions = plugin_pref_versions or versions
     if not matched_versions:
         return None
 
-    latest = max(matched_versions, key=lambda item: item.get("date_published", ""))
+    preferred_loaders = target_loaders or _modrinth_loader_hints_from_text(source_title)
+
+    def modrinth_sort_key(item: dict) -> tuple[int, str]:
+        item_loaders = [str(loader).lower() for loader in (item.get("loaders") or [])]
+        return (-_best_loader_rank(item_loaders, preferred_loaders), str(item.get("date_published", "")))
+
+    latest = max(matched_versions, key=modrinth_sort_key)
     files = latest.get("files", []) or []
     download_url = files[0].get("url", "") if files else ""
     return {
@@ -519,8 +574,16 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
 
 def hangar_platform_candidates(server_software: str) -> list[str]:
     normalized = normalize_server_software(server_software)
-    if normalized in {"paper", "spigot", "bukkit", "purpur", "folia"}:
-        return ["PAPER"]
+    if normalized == "purpur":
+        return ["PURPUR", "PAPER", "SPIGOT", "BUKKIT"]
+    if normalized == "paper":
+        return ["PAPER", "SPIGOT", "BUKKIT"]
+    if normalized == "spigot":
+        return ["SPIGOT", "BUKKIT"]
+    if normalized == "bukkit":
+        return ["BUKKIT"]
+    if normalized == "folia":
+        return ["FOLIA", "PAPER", "SPIGOT", "BUKKIT"]
     if normalized == "velocity":
         return ["VELOCITY"]
     if normalized in {"waterfall", "bungeecord"}:
@@ -640,7 +703,16 @@ def get_hangar_release(project_ref: str, server_version: str = "", server_softwa
     if not matched_versions:
         return None
 
-    latest = max(matched_versions, key=lambda item: item.get("createdAt", ""))
+    def hangar_sort_key(item: dict) -> tuple[int, str]:
+        platform_dependencies = item.get("platformDependencies") or {}
+        if not target_platforms:
+            return (0, str(item.get("createdAt", "")))
+        for index, platform in enumerate(target_platforms):
+            if platform in platform_dependencies:
+                return (-index, str(item.get("createdAt", "")))
+        return (-(len(target_platforms)), str(item.get("createdAt", "")))
+
+    latest = max(matched_versions, key=hangar_sort_key)
     downloads = latest.get("downloads") or {}
     download_url = ""
     candidate_platforms = target_platforms or list(downloads.keys())
@@ -2427,6 +2499,33 @@ class PluginManagerApp(Tk):
         form.columnconfigure(1, weight=1)
 
         selected_index: int | None = None
+        server_ids: list[int] = []
+
+        def refresh_server_list(selected_sid: int | None = None) -> None:
+            nonlocal selected_index, server_ids
+            try:
+                listbox.delete(0, END)
+            except Exception:
+                pass
+            servers = self.database.list_servers()
+            server_ids = [int(s["id"]) for s in servers]
+            for idx, s in enumerate(servers, start=1):
+                listbox.insert(END, f"{idx}: {s['name']}")
+
+            if selected_sid and selected_sid in server_ids:
+                selected_index = server_ids.index(selected_sid)
+            elif server_ids:
+                selected_index = 0
+            else:
+                selected_index = None
+
+            try:
+                if selected_index is not None:
+                    listbox.selection_set(selected_index)
+                    listbox.activate(selected_index)
+                    listbox.see(selected_index)
+            except Exception:
+                pass
 
         def load_server_into_form(sid: int) -> None:
             srv = self.database.get_server(sid)
@@ -2448,8 +2547,10 @@ class PluginManagerApp(Tk):
                 except Exception:
                     pass
                 return
-            text = listbox.get(sel[0])
-            sid = int(text.split(":", 1)[0])
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(server_ids):
+                return
+            sid = server_ids[idx]
             load_server_into_form(sid)
             try:
                 save_btn.config(text="保存")
@@ -2457,26 +2558,17 @@ class PluginManagerApp(Tk):
             except Exception:
                 pass
             try:
-                selected_index = sel[0]
+                selected_index = idx
             except Exception:
                 selected_index = None
 
-        servers = self.database.list_servers()
-        for s in servers:
-            listbox.insert(END, f"{s['id']}: {s['name']}")
+        refresh_server_list()
         listbox.bind("<<ListboxSelect>>", on_list_select)
         # select the first server by default when opening the manager
         try:
             if listbox.size() > 0:
-                listbox.selection_set(0)
-                listbox.activate(0)
-                listbox.see(0)
                 selected_index = 0
-                # trigger load into form
-                try:
-                    on_list_select()
-                except Exception:
-                    pass
+                on_list_select()
         except Exception:
             pass
 
@@ -2533,19 +2625,18 @@ class PluginManagerApp(Tk):
             folder = folder_var.get().strip()
             modch = normalize_modrinth_version_channel(modrinth_var.get())
             if sel:
-                text = listbox.get(sel[0])
-                sid = int(text.split(":", 1)[0])
+                idx = int(sel[0])
+                if idx < 0 or idx >= len(server_ids):
+                    return
+                sid = server_ids[idx]
                 try:
                     self.database.update_server(sid, name=name, server_version=version, server_software=software, plugin_folder=folder, modrinth_version_channel=modch)
-                    listbox.delete(sel[0])
-                    listbox.insert(sel[0], f"{sid}: {name}")
                 except sqlite3.IntegrityError:
                     messagebox.showerror("更新失敗", "同名のサーバーが既に存在します。別の名前を指定してください。", parent=dialog)
                     return
             else:
                 try:
                     sid = self.database.create_server(name=name, server_version=version, server_software=software, plugin_folder=folder, modrinth_version_channel=modch)
-                    listbox.insert(END, f"{sid}: {name}")
                     try:
                         new_btn.config(state="normal")
                     except Exception:
@@ -2583,14 +2674,17 @@ class PluginManagerApp(Tk):
                     pass
             except Exception:
                 pass
+            refresh_server_list(sid)
             self._load_servers_to_ui()
 
         def delete_server():
             sel = listbox.curselection()
             if not sel:
                 return
-            text = listbox.get(sel[0])
-            sid = int(text.split(":", 1)[0])
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(server_ids):
+                return
+            sid = server_ids[idx]
             if not messagebox.askyesno("削除確認", "このサーバーを削除しますか?", parent=dialog):
                 return
             try:
@@ -2598,13 +2692,19 @@ class PluginManagerApp(Tk):
             except Exception as exc:
                 messagebox.showerror("削除失敗", str(exc), parent=dialog)
                 return
-            listbox.delete(sel[0])
             try:
-                if listbox.size() == 0:
+                if len(server_ids) <= 1:
                     new_btn.config(state="disabled")
             except Exception:
                 pass
-            new_server()
+            refresh_server_list()
+            if server_ids:
+                try:
+                    on_list_select()
+                except Exception:
+                    pass
+            else:
+                new_server()
 
         # Buttons: stack vertically at the right side
         btn_frame = ttk.Frame(dialog)
@@ -3670,6 +3770,7 @@ class PluginManagerApp(Tk):
                     server_version=server_version,
                     server_software=server_software,
                     version_channel=self._get_modrinth_version_channel(),
+                    source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                 )
                 if not release:
                     raise RuntimeError(
@@ -3761,6 +3862,7 @@ class PluginManagerApp(Tk):
                             server_version=server_version,
                             server_software=server_software,
                             version_channel=self._get_modrinth_version_channel(),
+                            source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                         )
                     if not release:
                         raise RuntimeError(
