@@ -1027,6 +1027,7 @@ class PluginDatabase:
 
     # lightweight logger for DB operations
     _logger = logging.getLogger("minecraft_plugin_autoupdate_checker.db")
+    logging.basicConfig(level=logging.INFO)
 
     def open_server_db(self, server_id: int) -> None:
         """Open (or create) the per-server sqlite DB for the given server id.
@@ -1116,6 +1117,8 @@ class PluginDatabase:
         conn = self.server_connection
         if not conn:
             return
+        inserted = 0
+        updated = 0
         with conn:
             for entry in entries:
                 created_at = now_iso()
@@ -1132,6 +1135,11 @@ class PluginDatabase:
                         """,
                         (entry.plugin_name, entry.current_version, entry.file_name, created_at, entry.file_path),
                     )
+                    try:
+                        updated += 1
+                        self._logger.debug("upsert_local_plugins: updated %s", entry.file_path)
+                    except Exception:
+                        pass
                 else:
                     # include server_id when inserting into a server DB
                     if self.current_server_id:
@@ -1154,6 +1162,11 @@ class PluginDatabase:
                                 created_at,
                             ),
                         )
+                        try:
+                            inserted += 1
+                            self._logger.debug("upsert_local_plugins: inserted %s", entry.file_path)
+                        except Exception:
+                            pass
                     else:
                         conn.execute(
                             """
@@ -1173,6 +1186,15 @@ class PluginDatabase:
                                 created_at,
                             ),
                         )
+                        try:
+                            inserted += 1
+                            self._logger.debug("upsert_local_plugins: inserted %s", entry.file_path)
+                        except Exception:
+                            pass
+        try:
+            self._logger.info("upsert_local_plugins: inserted=%s updated=%s total=%s", inserted, updated, len(entries))
+        except Exception:
+            pass
 
     def upsert_imported_jars(self, jar_names: list[str], source_label: str = "manual listing") -> int:
         conn = self.server_connection
@@ -1191,6 +1213,10 @@ class PluginDatabase:
             )
 
         self.upsert_local_plugins(entries)
+        try:
+            self._logger.info("upsert_imported_jars: imported=%s", len(entries))
+        except Exception:
+            pass
         return len(entries)
 
     def _deduplicate_listing_plugins(self) -> None:
@@ -1401,6 +1427,10 @@ class PluginDatabase:
                     file_path,
                 ),
             )
+        try:
+            self._logger.debug("update_plugin_remote: %s -> %s", file_path, latest_version)
+        except Exception:
+            pass
 
     def get_plugin_by_path(self, file_path: str) -> sqlite3.Row | None:
         conn = self.server_connection
@@ -1414,6 +1444,10 @@ class PluginDatabase:
             return
         with conn:
             conn.execute("DELETE FROM plugins WHERE file_path = ?", (file_path,))
+        try:
+            self._logger.debug("delete_plugin_by_path: %s", file_path)
+        except Exception:
+            pass
 
 class IconManager:
     def __init__(self, app: "PluginManagerApp") -> None:
@@ -2214,15 +2248,29 @@ class PluginManagerApp(Tk):
     def _load_servers_to_ui(self) -> None:
         servers = self.database.list_servers()
         if not servers:
-            # create a default server from current settings
-            default = self.database.create_server(
-                name="Default",
-                server_version=self.server_version.get() or "",
-                server_software=self.server_software.get() or "",
-                plugin_folder=self.plugin_folder.get() or "",
-                modrinth_version_channel=self._get_modrinth_version_channel(),
-            )
-            servers = [self.database.get_server(default)]
+            # no servers present — do not auto-create a default entry
+            try:
+                self._logger.info("_load_servers_to_ui: no servers found, leaving UI empty")
+            except Exception:
+                pass
+            self._server_name_list = []
+            self._server_id_list = []
+            try:
+                if hasattr(self, "_server_combo_widget") and self._server_combo_widget is not None:
+                    self._server_combo_widget["values"] = self._server_name_list
+            except Exception:
+                pass
+            # clear selection state
+            try:
+                self._server_combo_var.set("")
+            except Exception:
+                pass
+            try:
+                self.selected_server_id.set(0)
+                self.database.set_setting("selected_server_id", "")
+            except Exception:
+                pass
+            return
 
         self._server_name_list = [s["name"] for s in servers]
         self._server_id_list = [s["id"] for s in servers]
