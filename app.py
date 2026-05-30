@@ -14,6 +14,7 @@ import concurrent.futures
 import urllib.parse
 import urllib.request
 import webbrowser
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -887,17 +888,45 @@ class ImportedJarEntry:
     file_path: str
 
 
+def _safe_log(logger: logging.Logger | None, level: int, msg: str, *args) -> None:
+    try:
+        if logger:
+            logger.log(level, msg, *args)
+    except Exception:
+        pass
+
+
+def _safe_debug(logger: logging.Logger | None, msg: str, *args) -> None:
+    _safe_log(logger, logging.DEBUG, msg, *args)
+
+
+def _safe_info(logger: logging.Logger | None, msg: str, *args) -> None:
+    _safe_log(logger, logging.INFO, msg, *args)
+
+
 class PluginDatabase:
     def __init__(self, db_path: Path) -> None:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         self.db_path = db_path
+        # master connection (stores settings and servers list)
         self.connection = sqlite3.connect(self.db_path)
         self.connection.row_factory = sqlite3.Row
+        # server-specific connection (plugins) — opened when a server is selected
+        self.server_connection: sqlite3.Connection | None = None
+        self.server_db_path: Path | None = None
+        self.current_server_id: int = 0
+
         self._init_schema()
+        # migrate existing plugins into per-server DBs if needed later (handled on open_server_db)
         self._migrate_spiget_rows()
         self._deduplicate_listing_plugins()
 
     def _init_schema(self) -> None:
+        """Initialize master database schema (settings, servers, legacy plugins).
+
+        This prepares the master connection used for application settings and the
+        servers list. Plugin rows may be migrated into per-server DBs later.
+        """
         with self.connection:
             self.connection.execute(
                 """
@@ -920,6 +949,7 @@ class PluginDatabase:
                     source_title TEXT NOT NULL DEFAULT '',
                     latest_version TEXT NOT NULL DEFAULT '',
                     latest_version_id TEXT NOT NULL DEFAULT '',
+                    server_id INTEGER NOT NULL DEFAULT 0,
                     latest_download_url TEXT NOT NULL DEFAULT '',
                     update_available INTEGER NOT NULL DEFAULT 0,
                     last_checked TEXT NOT NULL DEFAULT '',
@@ -929,14 +959,165 @@ class PluginDatabase:
                 )
                 """
             )
-            # ensure legacy DBs have the latest_version_id column
+            # create servers table
+            self.connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS servers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    server_version TEXT NOT NULL DEFAULT '',
+                    server_software TEXT NOT NULL DEFAULT '',
+                    plugin_folder TEXT NOT NULL DEFAULT '',
+                    modrinth_version_channel TEXT NOT NULL DEFAULT '',
+                    db_path TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            server_cols = [r[1] for r in self.connection.execute("PRAGMA table_info(servers)").fetchall()]
+            if "modrinth_version_channel" not in server_cols:
+                try:
+                    self.connection.execute("ALTER TABLE servers ADD COLUMN modrinth_version_channel TEXT NOT NULL DEFAULT ''")
+                except Exception:
+                    pass
+            # ensure legacy DBs have the latest_version_id and server_id columns
             cols = [r[1] for r in self.connection.execute("PRAGMA table_info(plugins)").fetchall()]
             if "latest_version_id" not in cols:
                 try:
                     self.connection.execute("ALTER TABLE plugins ADD COLUMN latest_version_id TEXT NOT NULL DEFAULT ''")
                 except Exception:
                     pass
+            if "server_id" not in cols:
+                try:
+                    self.connection.execute("ALTER TABLE plugins ADD COLUMN server_id INTEGER NOT NULL DEFAULT 0")
+                except Exception:
+                    pass
             self.connection.execute("CREATE INDEX IF NOT EXISTS idx_plugins_name ON plugins(plugin_name)")
+
+    def _init_plugins_schema(self, conn: sqlite3.Connection) -> None:
+        """Initialize plugins table/schema on the given connection (used for per-server DBs)."""
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS plugins (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        plugin_name TEXT NOT NULL,
+                        current_version TEXT NOT NULL DEFAULT '',
+                        file_name TEXT NOT NULL,
+                        file_path TEXT NOT NULL UNIQUE,
+                        source_type TEXT NOT NULL DEFAULT '',
+                        source_id TEXT NOT NULL DEFAULT '',
+                        source_title TEXT NOT NULL DEFAULT '',
+                        latest_version TEXT NOT NULL DEFAULT '',
+                        latest_version_id TEXT NOT NULL DEFAULT '',
+                        server_id INTEGER NOT NULL DEFAULT 0,
+                        latest_download_url TEXT NOT NULL DEFAULT '',
+                        update_available INTEGER NOT NULL DEFAULT 0,
+                        last_checked TEXT NOT NULL DEFAULT '',
+                        last_error TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                # ensure columns exist for legacy compatibility
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(plugins)").fetchall()]
+                if "latest_version_id" not in cols:
+                    try:
+                        conn.execute("ALTER TABLE plugins ADD COLUMN latest_version_id TEXT NOT NULL DEFAULT ''")
+                    except Exception:
+                        pass
+                if "server_id" not in cols:
+                    try:
+                        conn.execute("ALTER TABLE plugins ADD COLUMN server_id INTEGER NOT NULL DEFAULT 0")
+                    except Exception:
+                        pass
+                try:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_plugins_name ON plugins(plugin_name)")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # lightweight logger for DB operations
+    _logger = logging.getLogger("minecraft_plugin_autoupdate_checker.db")
+    logging.basicConfig(level=logging.INFO)
+    
+
+    def open_server_db(self, server_id: int) -> None:
+        """Open (or create) the per-server sqlite DB for the given server id.
+        This will initialize the plugins schema in that DB and move any matching rows
+        from the master plugins table if present.
+        """
+        row = None
+        try:
+            row = self.connection.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
+        except Exception:
+            row = None
+
+        if not row:
+            return
+
+        db_path_val = str(row_get(row, "db_path") or "").strip()
+        if not db_path_val:
+            server_dir = APP_DIR / "servers"
+            server_dir.mkdir(parents=True, exist_ok=True)
+            db_path = server_dir / f"server_{server_id}.sqlite"
+            db_path_val = str(db_path)
+            with self.connection:
+                self.connection.execute("UPDATE servers SET db_path = ? WHERE id = ?", (db_path_val, server_id))
+        else:
+            db_path = Path(db_path_val)
+
+        # if already opened and same path, nothing to do
+        if self.server_connection and self.server_db_path and Path(db_path) == Path(self.server_db_path):
+            return
+
+        # close previous
+        try:
+            if self.server_connection:
+                self.server_connection.close()
+        except Exception:
+            pass
+
+        # open new server DB
+        server_db_path = Path(db_path)
+        server_db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(server_db_path)
+        conn.row_factory = sqlite3.Row
+        self.server_connection = conn
+        self.server_db_path = server_db_path
+        self.current_server_id = server_id
+        # ensure plugins schema exists in server DB
+        try:
+            self._init_plugins_schema(conn)
+        except Exception:
+            pass
+        try:
+            self._logger.debug("Opened server DB %s for server_id=%s", server_db_path, server_id)
+        except Exception:
+            pass
+
+        # migrate rows from master plugins that belong to this server (server_id matches) OR global (server_id==0)
+        try:
+            master_rows = list(self.connection.execute("SELECT * FROM plugins WHERE server_id = ? OR server_id = 0", (server_id,)).fetchall())
+            if master_rows:
+                with conn:
+                    for r in master_rows:
+                        cols = [c[0] for c in self.connection.execute("PRAGMA table_info(plugins)").fetchall()]
+                        values = [r[c] if c in r.keys() else None for c in cols]
+                        placeholders = ",".join("?" for _ in cols)
+                        conn.execute(f"INSERT OR REPLACE INTO plugins({', '.join(cols)}) VALUES({placeholders})", values)
+                # delete migrated rows from master
+                ids = [str(int(r["id"])) for r in master_rows if r.get("id")]
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    with self.connection:
+                        self.connection.execute(f"DELETE FROM plugins WHERE id IN ({placeholders})", ids)
+        except Exception:
+            pass
 
     def get_setting(self, key: str, default: str = "") -> str:
         row = self.connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -950,15 +1131,20 @@ class PluginDatabase:
             )
 
     def upsert_local_plugins(self, entries: list[PluginEntry]) -> None:
-        with self.connection:
+        conn = self.server_connection
+        if not conn:
+            return
+        inserted = 0
+        updated = 0
+        with conn:
             for entry in entries:
                 created_at = now_iso()
-                existing = self.connection.execute(
+                existing = conn.execute(
                     "SELECT id FROM plugins WHERE file_path = ?",
                     (entry.file_path,),
                 ).fetchone()
                 if existing:
-                    self.connection.execute(
+                    conn.execute(
                         """
                         UPDATE plugins
                         SET plugin_name = ?, current_version = ?, file_name = ?, updated_at = ?
@@ -966,27 +1152,59 @@ class PluginDatabase:
                         """,
                         (entry.plugin_name, entry.current_version, entry.file_name, created_at, entry.file_path),
                     )
+                    updated += 1
+                    _safe_debug(self._logger, "upsert_local_plugins: updated %s", entry.file_path)
                 else:
-                    self.connection.execute(
-                        """
-                        INSERT INTO plugins(
-                            plugin_name, current_version, file_name, file_path,
-                            source_type, source_id, source_title,
-                            latest_version, latest_download_url, update_available,
-                            last_checked, last_error, created_at, updated_at
-                        ) VALUES(?, ?, ?, ?, '', '', '', '', '', 0, '', '', ?, ?)
-                        """,
-                        (
-                            entry.plugin_name,
-                            entry.current_version,
-                            entry.file_name,
-                            entry.file_path,
-                            created_at,
-                            created_at,
-                        ),
-                    )
+                    # include server_id when inserting into a server DB
+                    if self.current_server_id:
+                        conn.execute(
+                            """
+                            INSERT INTO plugins(
+                                plugin_name, current_version, file_name, file_path, server_id,
+                                source_type, source_id, source_title,
+                                latest_version, latest_download_url, update_available,
+                                last_checked, last_error, created_at, updated_at
+                            ) VALUES(?, ?, ?, ?, ?, '', '', '', '', '', 0, '', '', ?, ?)
+                            """,
+                            (
+                                entry.plugin_name,
+                                entry.current_version,
+                                entry.file_name,
+                                entry.file_path,
+                                int(self.current_server_id),
+                                created_at,
+                                created_at,
+                            ),
+                        )
+                        inserted += 1
+                        _safe_debug(self._logger, "upsert_local_plugins: inserted %s", entry.file_path)
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO plugins(
+                                plugin_name, current_version, file_name, file_path,
+                                source_type, source_id, source_title,
+                                latest_version, latest_download_url, update_available,
+                                last_checked, last_error, created_at, updated_at
+                            ) VALUES(?, ?, ?, ?, '', '', '', '', '', 0, '', '', ?, ?)
+                            """,
+                            (
+                                entry.plugin_name,
+                                entry.current_version,
+                                entry.file_name,
+                                entry.file_path,
+                                created_at,
+                                created_at,
+                            ),
+                        )
+                        inserted += 1
+                        _safe_debug(self._logger, "upsert_local_plugins: inserted %s", entry.file_path)
+        _safe_info(self._logger, "upsert_local_plugins: inserted=%s updated=%s total=%s", inserted, updated, len(entries))
 
     def upsert_imported_jars(self, jar_names: list[str], source_label: str = "manual listing") -> int:
+        conn = self.server_connection
+        if not conn:
+            return 0
         entries: list[PluginEntry] = []
         for jar_name in jar_names:
             plugin_name, version = extract_version_from_filename(jar_name)
@@ -1000,10 +1218,12 @@ class PluginDatabase:
             )
 
         self.upsert_local_plugins(entries)
+        _safe_info(self._logger, "upsert_imported_jars: imported=%s", len(entries))
         return len(entries)
 
     def _deduplicate_listing_plugins(self) -> None:
-        duplicates = self.connection.execute(
+        conn = self.server_connection or self.connection
+        duplicates = conn.execute(
             """
             SELECT file_name, current_version, MIN(id) AS keep_id, GROUP_CONCAT(id) AS ids, COUNT(*) AS count
             FROM plugins
@@ -1016,14 +1236,14 @@ class PluginDatabase:
         if not duplicates:
             return
 
-        with self.connection:
+        with conn:
             for row in duplicates:
                 keep_id = int(row["keep_id"])
                 ids = [int(value) for value in str(row["ids"]).split(",") if value]
                 delete_ids = [value for value in ids if value != keep_id]
                 if delete_ids:
                     placeholders = ",".join("?" for _ in delete_ids)
-                    self.connection.execute(f"DELETE FROM plugins WHERE id IN ({placeholders})", delete_ids)
+                    conn.execute(f"DELETE FROM plugins WHERE id IN ({placeholders})", delete_ids)
 
     def _migrate_spiget_rows(self) -> None:
         rows = self.connection.execute(
@@ -1052,10 +1272,16 @@ class PluginDatabase:
                 )
 
     def list_plugins(self) -> list[sqlite3.Row]:
-        return list(self.connection.execute("SELECT * FROM plugins ORDER BY plugin_name COLLATE NOCASE"))
+        conn = self.server_connection
+        if not conn:
+            return []
+        return list(conn.execute("SELECT * FROM plugins ORDER BY plugin_name COLLATE NOCASE"))
 
     def list_plugins_search(self, search: str | None = None) -> list[sqlite3.Row]:
         """List plugins, optionally filtering by a search string matching name, file or source."""
+        conn = self.server_connection
+        if not conn:
+            return []
         base_sql = "SELECT * FROM plugins"
         params: list[object] = []
         if search and search.strip():
@@ -1063,8 +1289,118 @@ class PluginDatabase:
             where = " WHERE (plugin_name LIKE ? OR file_name LIKE ? OR source_title LIKE ? OR source_id LIKE ?) "
             params = [term, term, term, term]
             sql = base_sql + where + " ORDER BY plugin_name COLLATE NOCASE"
-            return list(self.connection.execute(sql, params))
-        return list(self.connection.execute(base_sql + " ORDER BY plugin_name COLLATE NOCASE"))
+            return list(conn.execute(sql, params))
+        return list(conn.execute(base_sql + " ORDER BY plugin_name COLLATE NOCASE"))
+
+    # Servers API
+    def list_servers(self) -> list[sqlite3.Row]:
+        return list(self.connection.execute("SELECT * FROM servers ORDER BY name COLLATE NOCASE"))
+
+    def _normalize_server_input(
+        self,
+        name: str,
+        server_version: str = "",
+        server_software: str = "",
+        plugin_folder: str = "",
+        modrinth_version_channel: str = "",
+    ) -> tuple[str, str, str, str, str]:
+        """Normalize and trim server fields before insert/update."""
+        return (
+            str(name or "").strip() or "Default",
+            str(server_version or "").strip(),
+            str(server_software or "").strip(),
+            str(plugin_folder or "").strip(),
+            str(modrinth_version_channel or "").strip(),
+        )
+
+    def create_server(
+        self,
+        name: str,
+        server_version: str = "",
+        server_software: str = "",
+        plugin_folder: str = "",
+        modrinth_version_channel: str = "",
+    ) -> int:
+        name, server_version, server_software, plugin_folder, modrinth_version_channel = self._normalize_server_input(
+            name,
+            server_version,
+            server_software,
+            plugin_folder,
+            modrinth_version_channel,
+        )
+        now = now_iso()
+        with self.connection:
+            cur = self.connection.execute(
+                "INSERT INTO servers(name, server_version, server_software, plugin_folder, modrinth_version_channel, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (name, server_version, server_software, plugin_folder, modrinth_version_channel, now, now),
+            )
+            server_id = int(cur.lastrowid)
+            _safe_debug(self._logger, "create_server: id=%s name=%s version=%s software=%s folder=%s", server_id, name, server_version, server_software, plugin_folder)
+            return server_id
+
+    def get_server(self, server_id: int) -> sqlite3.Row | None:
+        try:
+            return self.connection.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
+        except Exception:
+            return None
+
+    def update_server(
+        self,
+        server_id: int,
+        name: str,
+        server_version: str,
+        server_software: str,
+        plugin_folder: str,
+        modrinth_version_channel: str = "",
+    ) -> None:
+        name, server_version, server_software, plugin_folder, modrinth_version_channel = self._normalize_server_input(
+            name,
+            server_version,
+            server_software,
+            plugin_folder,
+            modrinth_version_channel,
+        )
+        now = now_iso()
+        with self.connection:
+            self.connection.execute(
+                "UPDATE servers SET name = ?, server_version = ?, server_software = ?, plugin_folder = ?, modrinth_version_channel = ?, updated_at = ? WHERE id = ?",
+                (name, server_version, server_software, plugin_folder, modrinth_version_channel, now, server_id),
+            )
+            _safe_debug(self._logger, "update_server: id=%s name=%s version=%s software=%s folder=%s", server_id, name, server_version, server_software, plugin_folder)
+
+    def delete_server(self, server_id: int) -> None:
+        # attempt to remove associated server DB file if present
+        try:
+            row = self.connection.execute("SELECT db_path FROM servers WHERE id = ?", (server_id,)).fetchone()
+            db_path_val = str(row["db_path"] or "") if row else ""
+            if db_path_val:
+                try:
+                    p = Path(db_path_val)
+                    # if this is the currently opened server DB, close connection first
+                    try:
+                        if getattr(self, "server_db_path", None) and Path(self.server_db_path) == p and self.server_connection:
+                            try:
+                                self.server_connection.close()
+                            except Exception:
+                                pass
+                            self.server_connection = None
+                            self.server_db_path = None
+                            self.current_server_id = 0
+                    except Exception:
+                        pass
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        with self.connection:
+            self.connection.execute("DELETE FROM servers WHERE id = ?", (server_id,))
+            _safe_debug(self._logger, "delete_server: id=%s", server_id)
 
     def update_plugin_remote(
         self,
@@ -1079,8 +1415,11 @@ class PluginDatabase:
         last_checked: str,
         last_error: str,
     ) -> None:
-        with self.connection:
-            self.connection.execute(
+        conn = self.server_connection
+        if not conn:
+            return
+        with conn:
+            conn.execute(
                 """
                 UPDATE plugins
                 SET source_type = ?, source_id = ?, source_title = ?, latest_version = ?,
@@ -1102,6 +1441,21 @@ class PluginDatabase:
                     file_path,
                 ),
             )
+        _safe_debug(self._logger, "update_plugin_remote: %s -> %s", file_path, latest_version)
+
+    def get_plugin_by_path(self, file_path: str) -> sqlite3.Row | None:
+        conn = self.server_connection
+        if not conn:
+            return None
+        return conn.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+
+    def delete_plugin_by_path(self, file_path: str) -> None:
+        conn = self.server_connection
+        if not conn:
+            return
+        with conn:
+            conn.execute("DELETE FROM plugins WHERE file_path = ?", (file_path,))
+        _safe_debug(self._logger, "delete_plugin_by_path: %s", file_path)
 
 class IconManager:
     def __init__(self, app: "PluginManagerApp") -> None:
@@ -1350,6 +1704,40 @@ class PluginManagerApp(Tk):
         if self.plugin_folder.get():
             self._log(f"前回のプラグインフォルダを読み込みました: {self.plugin_folder.get()}")
 
+        # If there are no servers in the DB, prompt the user to add one by
+        # automatically opening the server manager after the main window shows.
+        try:
+            servers = self.database.list_servers()
+            if not servers:
+                def _prompt_create_server():
+                    try:
+                        messagebox.showinfo("サーバー未登録", "サーバーが登録されていません。サーバー管理で新しいサーバーを追加してください。", parent=self)
+                    except Exception:
+                        try:
+                            messagebox.showinfo("サーバー未登録", "サーバーが登録されていません。サーバー管理で新しいサーバーを追加してください。")
+                        except Exception:
+                            pass
+                    try:
+                        self._open_server_manager()
+                    except Exception:
+                        pass
+
+                self.after(300, _prompt_create_server)
+        except Exception:
+            pass
+
+        # selected server id (0 == global)
+        try:
+            sel = int(self.database.get_setting("selected_server_id", "0") or "0")
+        except Exception:
+            sel = 0
+        self.selected_server_id = tk.IntVar(value=sel)
+        try:
+            if sel:
+                self.database.open_server_db(sel)
+        except Exception:
+            pass
+
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill=BOTH, expand=True)
@@ -1389,21 +1777,24 @@ class PluginManagerApp(Tk):
 
         server_frame = ttk.LabelFrame(top, text="サーバー設定")
         server_frame.pack(side=LEFT, fill=X, expand=True)
+        # server selector
+        ttk.Label(server_frame, text="サーバー").pack(side=LEFT, padx=(8, 4), pady=8)
+        self._server_combo_var = StringVar(value="")
+        self._server_name_list: list[str] = []
+        self._server_id_list: list[int] = []
+        self._server_combo_widget = ttk.Combobox(server_frame, textvariable=self._server_combo_var, state="readonly", width=18)
+        self._server_combo_widget.pack(side=LEFT, padx=(0, 8), pady=8)
+        self._server_combo_widget.bind("<<ComboboxSelected>>", lambda event: self._on_server_combo_changed())
+        manage_btn = ttk.Button(server_frame, text="サーバー管理", command=lambda: self._open_server_manager())
+        manage_btn.pack(side=LEFT, padx=(0, 8), pady=8)
 
-        ttk.Label(server_frame, text="バージョン").pack(side=LEFT, padx=(8, 4), pady=8)
-        server_version_entry = ttk.Entry(server_frame, textvariable=self.server_version, width=12)
-        server_version_entry.pack(side=LEFT, padx=(0, 10), pady=8)
+        # populate server list in main UI now
+        try:
+            self._load_servers_to_ui()
+        except Exception:
+            pass
 
-        ttk.Label(server_frame, text="ソフト").pack(side=LEFT, padx=(0, 4), pady=8)
-        server_software_combo = ttk.Combobox(
-            server_frame,
-            textvariable=self.server_software,
-            values=SERVER_SOFTWARE_OPTIONS,
-            state="readonly",
-            width=10,
-        )
-        server_software_combo.pack(side=LEFT, padx=(0, 10), pady=8)
-
+        # バージョン/ソフトはサーバー管理ダイアログで設定します
         ttk.Label(server_frame, text="チャンネル").pack(side=LEFT, padx=(0, 4), pady=8)
         modrinth_version_combo = ttk.Combobox(
             server_frame,
@@ -1422,8 +1813,6 @@ class PluginManagerApp(Tk):
             spin = tk.Entry(server_frame, width=3, textvariable=self.concurrency_workers)
         spin.pack(side=LEFT, padx=(0, 10), pady=8)
         try:
-            Tooltip(server_version_entry, "サーバーの Minecraft バージョン。\n更新判定時の絞り込みに使用します。例: 1.21.1")
-            Tooltip(server_software_combo, "サーバーソフトを指定します。\n'自動'にすると推測に任せます。")
             Tooltip(modrinth_version_combo, "Modrinth で取得するバージョンチャンネル。\n安定版のみ/ベータ含む/アルファ含む を切り替えます。")
             Tooltip(spin, "更新確認で同時に実行するワーカー数。\n値を大きくすると処理は速くなりますが、\n同時接続が増えるため公開APIへの負荷が高まり、\nアクセス制限（ブロック）される可能性があります。\n安全な目安: 4〜8")
         except Exception:
@@ -1433,7 +1822,7 @@ class PluginManagerApp(Tk):
         self.server_software.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.modrinth_version_channel.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.concurrency_workers.trace_add("write", lambda *args: self._schedule_server_settings_save())
-        server_software_combo.bind("<<ComboboxSelected>>", lambda event: self._schedule_server_settings_save())
+        # server version/software moved to server manager; no widget to bind here
         modrinth_version_combo.bind("<<ComboboxSelected>>", lambda event: self._schedule_server_settings_save())
 
         listing_frame = ttk.LabelFrame(outer, text="一覧から取り込み")
@@ -1784,13 +2173,453 @@ class PluginManagerApp(Tk):
             self.database.set_setting("concurrency_workers", str(int(self.concurrency_workers.get())))
         except Exception:
             pass
-        self.status_text.set(f"DB: {DB_PATH} / サーバー: {software or '自動'} {version or '-'}")
+        # If a server is selected, persist these values on the server row as well
+        try:
+            sid = int(self.selected_server_id.get() or 0)
+        except Exception:
+            sid = 0
+        if sid:
+            srv = self.database.get_server(sid)
+            if srv:
+                name = str(row_get(srv, "name") or f"Server {sid}")
+                try:
+                    self.database.update_server(
+                        sid,
+                        name=name,
+                        server_version=version,
+                        server_software=software,
+                        plugin_folder=self.plugin_folder.get() or "",
+                        modrinth_version_channel=modrinth_channel,
+                    )
+                except Exception:
+                    pass
+
+        db_label = DB_PATH
+        if getattr(self.database, "server_db_path", None):
+            db_label = getattr(self.database, "server_db_path")
+        self.status_text.set(f"DB: {db_label} / サーバー: {software or '自動'} {version or '-'}")
+
+    def _filter_rows_for_selected_server(self, rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        try:
+            sid = int(self.selected_server_id.get() or 0)
+        except Exception:
+            sid = 0
+        if sid == 0:
+            return rows
+        filtered: list[sqlite3.Row] = []
+        for r in rows:
+            try:
+                rid = int(row_get(r, "server_id") or 0)
+            except Exception:
+                rid = 0
+            if rid == 0 or rid == sid:
+                filtered.append(r)
+        return filtered
 
     def _get_server_context(self) -> tuple[str, str]:
+        try:
+            sid = int(self.selected_server_id.get() or 0)
+        except Exception:
+            sid = 0
+        if sid:
+            row = self.database.get_server(sid)
+            if row is not None:
+                return str(row_get(row, "server_version") or "").strip(), str(row_get(row, "server_software") or "").strip()
         return self.server_version.get().strip(), self.server_software.get().strip()
 
     def _get_modrinth_version_channel(self) -> str:
         return normalize_modrinth_version_channel(self.modrinth_version_channel.get())
+
+    def _apply_server_row_to_ui(self, srv: sqlite3.Row | None) -> None:
+        """Apply values from a server row to the main UI StringVars."""
+        if srv is None:
+            return
+        try:
+            server_version = str(row_get(srv, "server_version") or "").strip()
+            server_software = str(row_get(srv, "server_software") or "").strip()
+            plugin_folder = str(row_get(srv, "plugin_folder") or "").strip()
+            modrinth_channel = str(row_get(srv, "modrinth_version_channel") or "").strip()
+            if plugin_folder:
+                self.plugin_folder.set(plugin_folder)
+            if server_version:
+                self.server_version.set(server_version)
+            if server_software:
+                self.server_software.set(server_software)
+            if modrinth_channel:
+                try:
+                    self.modrinth_version_channel.set(modrinth_version_channel_label(modrinth_channel))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _set_server_combo_values(self, names: list[str]) -> None:
+        """Set server combo values safely when widget is available."""
+        try:
+            if hasattr(self, "_server_combo_widget") and self._server_combo_widget is not None:
+                self._server_combo_widget["values"] = names
+        except Exception:
+            pass
+
+    def _select_server_by_id(self, target_sid: int | None, reload_tree: bool = False) -> None:
+        """Select a server by id and sync DB/UI state if the id exists."""
+        try:
+            if target_sid and target_sid in self._server_id_list:
+                idx = self._server_id_list.index(target_sid)
+                self._server_combo_var.set(self._server_name_list[idx])
+                self.selected_server_id.set(target_sid)
+                self.database.set_setting("selected_server_id", str(target_sid))
+                try:
+                    self.database.open_server_db(int(target_sid))
+                except Exception:
+                    pass
+                try:
+                    srv = self.database.get_server(target_sid)
+                    if srv:
+                        self._apply_server_row_to_ui(srv)
+                except Exception:
+                    pass
+                if reload_tree:
+                    try:
+                        self.reload_tree()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _load_servers_to_ui(self) -> None:
+        servers = self.database.list_servers()
+        if not servers:
+            # no servers present — do not auto-create a default entry
+            _safe_info(self._logger, "_load_servers_to_ui: no servers found, leaving UI empty")
+            self._server_name_list = []
+            self._server_id_list = []
+            self._set_server_combo_values(self._server_name_list)
+            # clear selection state
+            try:
+                self._server_combo_var.set("")
+            except Exception:
+                pass
+            try:
+                self.selected_server_id.set(0)
+                self.database.set_setting("selected_server_id", "")
+            except Exception:
+                pass
+            try:
+                self.reload_tree()
+            except Exception:
+                pass
+            return
+
+        self._server_name_list = [s["name"] for s in servers]
+        self._server_id_list = [s["id"] for s in servers]
+        self._set_server_combo_values(self._server_name_list)
+        # select stored server or default
+        try:
+            sid = int(self.selected_server_id.get() or 0)
+        except Exception:
+            sid = 0
+
+        if sid and sid in self._server_id_list:
+            self._select_server_by_id(sid)
+        else:
+            if self._server_name_list:
+                self._select_server_by_id(self._server_id_list[0])
+        # Refresh plugin list once after switching active server context.
+        try:
+            self.reload_tree()
+        except Exception:
+            pass
+
+    def _on_server_combo_changed(self) -> None:
+        name = self._server_combo_var.get()
+        if name and name in self._server_name_list:
+            idx = self._server_name_list.index(name)
+            sid = self._server_id_list[idx]
+            self._select_server_by_id(sid, reload_tree=True)
+
+    def _open_server_manager(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("サーバー管理")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        # two-pane server manager: list on left, edit form on right
+        # keep selection visible even when focus moves to form widgets
+        listbox = tk.Listbox(dialog, width=36, height=12, exportselection=False)
+        listbox.pack(side=LEFT, padx=(8, 0), pady=8)
+
+        form = ttk.Frame(dialog)
+        form.pack(side=LEFT, fill=BOTH, expand=True, padx=8, pady=8)
+
+        ttk.Label(form, text="名前").grid(row=0, column=0, sticky="w")
+        name_var = StringVar()
+        name_entry = ttk.Entry(form, textvariable=name_var)
+        name_entry.grid(row=0, column=1, sticky="ew", pady=2)
+
+        ttk.Label(form, text="バージョン").grid(row=1, column=0, sticky="w")
+        version_var = StringVar()
+        version_entry = ttk.Entry(form, textvariable=version_var)
+        version_entry.grid(row=1, column=1, sticky="ew", pady=2)
+
+        ttk.Label(form, text="ソフト").grid(row=2, column=0, sticky="w")
+        software_var = StringVar()
+        software_combo = ttk.Combobox(form, textvariable=software_var, values=SERVER_SOFTWARE_OPTIONS, state="readonly")
+        software_combo.grid(row=2, column=1, sticky="ew", pady=2)
+
+        ttk.Label(form, text="プラグインフォルダ").grid(row=3, column=0, sticky="w")
+        folder_var = StringVar()
+        folder_entry = ttk.Entry(form, textvariable=folder_var)
+        folder_entry.grid(row=3, column=1, sticky="ew", pady=2)
+        def choose_folder_for_server():
+            sel = filedialog.askdirectory(title="サーバーのプラグインフォルダを選択", parent=dialog)
+            if sel:
+                folder_var.set(sel)
+        ttk.Button(form, text="参照", command=choose_folder_for_server).grid(row=3, column=2, padx=(6,0))
+
+        ttk.Label(form, text="Modrinth チャンネル").grid(row=4, column=0, sticky="w")
+        modrinth_var = StringVar()
+        modrinth_combo = ttk.Combobox(form, textvariable=modrinth_var, values=tuple(MODRINTH_VERSION_CHANNEL_LABELS.values()), state="readonly")
+        modrinth_combo.grid(row=4, column=1, sticky="ew", pady=2)
+
+        form.columnconfigure(1, weight=1)
+
+        selected_index: int | None = None
+
+        def load_server_into_form(sid: int) -> None:
+            srv = self.database.get_server(sid)
+            if not srv:
+                return
+            name_var.set(str(row_get(srv, "name") or ""))
+            version_var.set(str(row_get(srv, "server_version") or ""))
+            software_var.set(str(row_get(srv, "server_software") or ""))
+            folder_var.set(str(row_get(srv, "plugin_folder") or ""))
+            modrinth_var.set(modrinth_version_channel_label(str(row_get(srv, "modrinth_version_channel") or "")))
+
+        def on_list_select(evt=None):
+            nonlocal selected_index
+            sel = listbox.curselection()
+            if not sel:
+                try:
+                    save_btn.config(text="保存して追加")
+                    del_btn.config(state="disabled")
+                except Exception:
+                    pass
+                return
+            text = listbox.get(sel[0])
+            sid = int(text.split(":", 1)[0])
+            load_server_into_form(sid)
+            try:
+                save_btn.config(text="保存")
+                del_btn.config(state="normal")
+            except Exception:
+                pass
+            try:
+                selected_index = sel[0]
+            except Exception:
+                selected_index = None
+
+        servers = self.database.list_servers()
+        for s in servers:
+            listbox.insert(END, f"{s['id']}: {s['name']}")
+        listbox.bind("<<ListboxSelect>>", on_list_select)
+        # select the first server by default when opening the manager
+        try:
+            if listbox.size() > 0:
+                listbox.selection_set(0)
+                listbox.activate(0)
+                listbox.see(0)
+                selected_index = 0
+                # trigger load into form
+                try:
+                    on_list_select()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Restore listbox selection when form fields gain focus (some platforms may clear selection)
+        def _restore_selection_on_focus(evt=None):
+            try:
+                cur = listbox.curselection()
+                if cur:
+                    return
+                if selected_index is not None and 0 <= selected_index < listbox.size():
+                    listbox.selection_set(selected_index)
+                    listbox.activate(selected_index)
+                    listbox.see(selected_index)
+            except Exception:
+                pass
+
+        for w in (name_entry, version_entry, software_combo, folder_entry, modrinth_combo):
+            try:
+                w.bind('<FocusIn>', _restore_selection_on_focus)
+            except Exception:
+                pass
+
+        def new_server():
+            nonlocal selected_index
+            try:
+                listbox.selection_clear(0, END)
+            except Exception:
+                pass
+            # prevent _restore_selection_on_focus from re-selecting previous item
+            try:
+                selected_index = None
+            except Exception:
+                pass
+            name_var.set("")
+            version_var.set("")
+            software_var.set("")
+            folder_var.set("")
+            modrinth_var.set("")
+            try:
+                name_entry.focus_set()
+            except Exception:
+                pass
+            try:
+                save_btn.config(text="保存して追加")
+                del_btn.config(state="disabled")
+            except Exception:
+                pass
+
+        def save_server():
+            sel = listbox.curselection()
+            name = name_var.get().strip() or "Default"
+            version = version_var.get().strip()
+            software = software_var.get().strip()
+            folder = folder_var.get().strip()
+            modch = normalize_modrinth_version_channel(modrinth_var.get())
+            if sel:
+                text = listbox.get(sel[0])
+                sid = int(text.split(":", 1)[0])
+                try:
+                    self.database.update_server(sid, name=name, server_version=version, server_software=software, plugin_folder=folder, modrinth_version_channel=modch)
+                    listbox.delete(sel[0])
+                    listbox.insert(sel[0], f"{sid}: {name}")
+                except sqlite3.IntegrityError:
+                    messagebox.showerror("更新失敗", "同名のサーバーが既に存在します。別の名前を指定してください。", parent=dialog)
+                    return
+            else:
+                try:
+                    sid = self.database.create_server(name=name, server_version=version, server_software=software, plugin_folder=folder, modrinth_version_channel=modch)
+                    listbox.insert(END, f"{sid}: {name}")
+                    try:
+                        new_btn.config(state="normal")
+                    except Exception:
+                        pass
+                except sqlite3.IntegrityError:
+                    messagebox.showerror("追加失敗", "同名のサーバーが既に存在します。別の名前を指定してください。", parent=dialog)
+                    return
+            # ensure the saved/created server becomes the selected server in main UI
+            try:
+                self.database.set_setting("selected_server_id", str(sid))
+                # use centralized selection logic to open server DB, apply row to UI and reload
+                try:
+                    self._select_server_by_id(sid, reload_tree=True)
+                except Exception:
+                    # best-effort: fall back to explicit open
+                    try:
+                        self.database.open_server_db(int(sid))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Immediately update main UI variables so changes are visible
+            try:
+                # update main UI fields from the values just saved in the dialog
+                if version is not None:
+                    self.server_version.set(version)
+                if software is not None:
+                    self.server_software.set(software)
+                if folder is not None:
+                    self.plugin_folder.set(folder)
+                try:
+                    self.modrinth_version_channel.set(modrinth_version_channel_label(modch))
+                except Exception:
+                    pass
+                try:
+                    # persist these settings and update server row if needed
+                    self._schedule_server_settings_save()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self._load_servers_to_ui()
+
+        def delete_server():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            text = listbox.get(sel[0])
+            sid = int(text.split(":", 1)[0])
+            if not messagebox.askyesno("削除確認", "このサーバーを削除しますか?", parent=dialog):
+                return
+            try:
+                self.database.delete_server(sid)
+            except Exception as exc:
+                messagebox.showerror("削除失敗", str(exc), parent=dialog)
+                return
+            listbox.delete(sel[0])
+            try:
+                if listbox.size() == 0:
+                    new_btn.config(state="disabled")
+            except Exception:
+                pass
+            new_server()
+
+        # Buttons: stack vertically at the right side
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(side=RIGHT, fill=Y, padx=8, pady=8)
+        new_btn = ttk.Button(btn_frame, text="新規作成", command=new_server)
+        new_btn.pack(side="top", pady=4, padx=4, fill=X)
+        save_btn = ttk.Button(btn_frame, text="保存して追加", command=save_server)
+        save_btn.pack(side="top", pady=4, padx=4, fill=X)
+        del_btn = ttk.Button(btn_frame, text="削除", command=delete_server)
+        del_btn.pack(side="top", pady=4, padx=4, fill=X)
+        close_btn = ttk.Button(btn_frame, text="閉じる", command=dialog.destroy)
+        close_btn.pack(side="top", pady=4, padx=4, fill=X)
+        try:
+            del_btn.config(state="disabled")
+        except Exception:
+            pass
+        try:
+            if listbox.size() == 0:
+                new_btn.config(state="disabled")
+            else:
+                new_btn.config(state="normal")
+        except Exception:
+            pass
+
+        # Center the dialog over the parent window
+        try:
+            dialog.update_idletasks()
+            dw = dialog.winfo_width()
+            dh = dialog.winfo_height()
+            px = self.winfo_rootx()
+            py = self.winfo_rooty()
+            pw = self.winfo_width()
+            ph = self.winfo_height()
+            if pw <= 1 and ph <= 1:
+                sw = self.winfo_screenwidth()
+                sh = self.winfo_screenheight()
+                x = (sw - dw) // 2
+                y = (sh - dh) // 2
+            else:
+                x = px + max(0, (pw - dw) // 2)
+                y = py + max(0, (ph - dh) // 2)
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        # wait until the dialog is closed, then refresh servers in main UI
+        try:
+            dialog.wait_window()
+            try:
+                self._load_servers_to_ui()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _on_search_changed(self, event=None) -> None:
         """Debounce search input and reload the list after a short delay."""
@@ -1821,7 +2650,7 @@ class PluginManagerApp(Tk):
 
     def _select_row(self, file_path: str) -> None:
         self.selected_file_path = file_path or None
-        self._render_db_text(self.database.list_plugins())
+        self._render_db_text(self._filter_rows_for_selected_server(self.database.list_plugins()))
 
     def _get_selected_row(self) -> sqlite3.Row | None:
         file_path = self.selected_file_path
@@ -1829,7 +2658,7 @@ class PluginManagerApp(Tk):
             return None
 
         try:
-            return self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+            return self.database.get_plugin_by_path(file_path)
         except Exception:
             return None
 
@@ -1844,7 +2673,7 @@ class PluginManagerApp(Tk):
         return bool(last_error.strip())
 
     def _failed_match_rows(self) -> list[sqlite3.Row]:
-        return [row for row in self.database.list_plugins() if self._is_match_failure(row)]
+        return [row for row in self._filter_rows_for_selected_server(self.database.list_plugins()) if self._is_match_failure(row)]
 
     def _prompt_modrinth_url(self, row: sqlite3.Row, title: str) -> str | None:
         current = str(row_get(row, "source_id") or "")
@@ -1856,7 +2685,7 @@ class PluginManagerApp(Tk):
         )
 
     def _refresh_match_for_file(self, file_path: str) -> None:
-        row = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+        row = self.database.get_plugin_by_path(file_path)
         if row is None:
             return
         result = self._resolve_entry_update(row)
@@ -1972,12 +2801,15 @@ class PluginManagerApp(Tk):
             messagebox.showwarning("URL無効", "Modrinth / Hangar / GitHub / SpigotMC の project URL または project ref を入力してください。")
             return False
 
-        file_path = str(row_get(row, "file_path") or "")
         if not file_path:
             return False
 
-        with self.database.connection:
-            self.database.connection.execute(
+        conn = self.database.server_connection
+        if not conn:
+            return False
+
+        with conn:
+            conn.execute(
                 """
                 UPDATE plugins
                 SET source_type = ?, source_id = ?, source_title = ?, last_error = ?, updated_at = ?
@@ -2197,6 +3029,10 @@ class PluginManagerApp(Tk):
             self._open_homepage_for_row(row)
 
     def _add_plugin_from_source_url(self) -> None:
+        if not self.database.server_connection:
+            messagebox.showwarning("サーバー未選択", "サーバーが選択されていません。\n(サーバー管理から追加・選択してください)")
+            return
+
         source_value = simpledialog.askstring(
             "配布元URLで追加",
             "配布元の URL または project ref を入力してください。SpigotMC は resource ID でも可です。",
@@ -2230,18 +3066,17 @@ class PluginManagerApp(Tk):
             ]
         )
 
-        row = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+        row = self.database.get_plugin_by_path(file_path)
         if row is None:
             messagebox.showerror("追加失敗", "新規プラグインの登録に失敗しました。")
             return
 
         if not self._apply_manual_match_url(row, source_value):
-            with self.database.connection:
-                self.database.connection.execute("DELETE FROM plugins WHERE file_path = ?", (file_path,))
+            self.database.delete_plugin_by_path(file_path)
             self.reload_tree()
             return
 
-        resolved_row = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+        resolved_row = self.database.get_plugin_by_path(file_path)
         if resolved_row is not None:
             resolved_title = str(row_get(resolved_row, "source_title") or row_get(resolved_row, "plugin_name") or "手動追加")
             resolved_file_name = f"{safe_filename(resolved_title)}.jar"
@@ -2254,22 +3089,24 @@ class PluginManagerApp(Tk):
             elif current_version and latest_version:
                 update_available = 1 if compare_versions(latest_version, current_version) > 0 else 0
 
-            with self.database.connection:
-                self.database.connection.execute(
-                    """
-                    UPDATE plugins
-                    SET plugin_name = ?, file_name = ?, current_version = ?, update_available = ?, updated_at = ?
-                    WHERE file_path = ?
-                    """,
-                    (
-                        resolved_title,
-                        resolved_file_name,
-                        current_version,
-                        update_available,
-                        now_iso(),
-                        file_path,
-                    ),
-                )
+            conn = self.database.server_connection
+            if conn:
+                with conn:
+                    conn.execute(
+                        """
+                        UPDATE plugins
+                        SET plugin_name = ?, file_name = ?, current_version = ?, update_available = ?, updated_at = ?
+                        WHERE file_path = ?
+                        """,
+                        (
+                            resolved_title,
+                            resolved_file_name,
+                            current_version,
+                            update_available,
+                            now_iso(),
+                            file_path,
+                        ),
+                    )
 
         self.reload_tree()
         self._log(f"配布元URLで追加しました: {source_value}")
@@ -2310,15 +3147,14 @@ class PluginManagerApp(Tk):
             return
 
         try:
-            with self.database.connection:
-                self.database.connection.execute("DELETE FROM plugins WHERE file_path = ?", (file_path,))
+            self.database.delete_plugin_by_path(file_path)
             self.reload_tree()
             self._log(f"削除しました: {plugin_name}")
         except Exception as exc:
             messagebox.showerror("削除失敗", str(exc))
 
     def _export_plugins(self) -> None:
-        rows = self.database.list_plugins()
+        rows = self._filter_rows_for_selected_server(self.database.list_plugins())
         if not rows:
             messagebox.showinfo("対象なし", "エクスポートするプラグインがありません。")
             return
@@ -2368,9 +3204,12 @@ class PluginManagerApp(Tk):
             new_version = target_version.get().strip()
             if not new_version:
                 return
+            conn = self.database.server_connection
+            if not conn:
+                return
             try:
-                with self.database.connection:
-                    self.database.connection.execute(
+                with conn:
+                    conn.execute(
                         "UPDATE plugins SET current_version = ?, updated_at = ? WHERE file_path = ?",
                         (new_version, now_iso(), row_get(row, "file_path")),
                     )
@@ -2473,7 +3312,19 @@ class PluginManagerApp(Tk):
         selected = filedialog.askdirectory(title="プラグインフォルダを選択")
         if selected:
             self.plugin_folder.set(selected)
-            self.database.set_setting("plugin_folder", selected)
+            try:
+                sid = int(self.selected_server_id.get() or 0)
+            except Exception:
+                sid = 0
+            if sid:
+                srv = self.database.get_server(sid)
+                name = str(row_get(srv, "name") or f"Server {sid}")
+                try:
+                    self.database.update_server(sid, name=name, server_version=self.server_version.get() or "", server_software=self.server_software.get() or "", plugin_folder=selected, modrinth_version_channel=self._get_modrinth_version_channel())
+                except Exception:
+                    self.database.set_setting("plugin_folder", selected)
+            else:
+                self.database.set_setting("plugin_folder", selected)
             self._log(f"フォルダを設定しました: {selected}")
 
     def load_listing_file(self) -> None:
@@ -2490,6 +3341,10 @@ class PluginManagerApp(Tk):
         self._log(f"一覧ファイルを読み込みました: {file_path}")
 
     def import_listing_text(self) -> None:
+        if not self.database.server_connection:
+            messagebox.showwarning("サーバー未選択", "サーバーが選択されていません。\n(サーバー管理から追加・選択してください)")
+            return
+
         listing_text = self.listing_text.get("1.0", END).strip()
         if not listing_text:
             messagebox.showwarning("一覧が空です", "ls等の一覧テキストを貼り付けるか、ファイルから読込を行ってください。")
@@ -2506,6 +3361,10 @@ class PluginManagerApp(Tk):
         messagebox.showinfo("取り込み完了", f"{imported}件の .jar をDBに登録しました。")
 
     def scan_folder(self) -> None:
+        if not self.database.server_connection:
+            messagebox.showwarning("サーバー未選択", "サーバーが選択されていません。\n(サーバー管理から追加・選択してください)")
+            return
+
         folder_value = self.plugin_folder.get().strip()
         if not folder_value:
             messagebox.showwarning("フォルダ未設定", "プラグインフォルダを選択してください。")
@@ -2519,7 +3378,19 @@ class PluginManagerApp(Tk):
         self._set_busy("スキャン中")
         entries = scan_plugin_folder(folder)
         self.database.upsert_local_plugins(entries)
-        self.database.set_setting("plugin_folder", str(folder.resolve()))
+        try:
+            sid = int(self.selected_server_id.get() or 0)
+        except Exception:
+            sid = 0
+        if sid:
+            srv = self.database.get_server(sid)
+            name = str(row_get(srv, "name") or f"Server {sid}")
+            try:
+                self.database.update_server(sid, name=name, server_version=self.server_version.get() or "", server_software=self.server_software.get() or "", plugin_folder=str(folder.resolve()), modrinth_version_channel=self._get_modrinth_version_channel())
+            except Exception:
+                self.database.set_setting("plugin_folder", str(folder.resolve()))
+        else:
+            self.database.set_setting("plugin_folder", str(folder.resolve()))
         self.reload_tree()
         self._set_busy("待機中")
         self._log(f"{len(entries)}件のプラグインをデータベースに登録しました。")
@@ -2550,7 +3421,7 @@ class PluginManagerApp(Tk):
 
         # use search text to filter rows when provided
         search = (self.search_text.get() or "").strip() if getattr(self, "search_text", None) is not None else ""
-        rows = self.database.list_plugins_search(search)
+        rows = self._filter_rows_for_selected_server(self.database.list_plugins_search(search))
 
         self.tree.delete(*self.tree.get_children())
         self.row_index = {str(row["file_path"]): row for row in rows}
@@ -2790,7 +3661,7 @@ class PluginManagerApp(Tk):
             }
 
     def check_updates(self) -> None:
-        rows = self.database.list_plugins()
+        rows = self._filter_rows_for_selected_server(self.database.list_plugins())
         if not rows:
             messagebox.showinfo("対象なし", "先にプラグインフォルダをスキャンするか手動追加してください。")
             return
@@ -2860,10 +3731,7 @@ class PluginManagerApp(Tk):
                 updates_found.append(item)
 
             if str(result.get("last_error") or "").strip():
-                row = self.database.connection.execute(
-                    "SELECT * FROM plugins WHERE file_path = ?",
-                    (item["file_path"],),
-                ).fetchone()
+                row = self.database.get_plugin_by_path(item["file_path"])
                 if row is not None:
                     failed_rows.append(row)
 
@@ -2934,7 +3802,7 @@ class PluginManagerApp(Tk):
                 result = row_get(row, "result") or {}
                 file_path = row_get(row, "file_path")
                 try:
-                    dbrow = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+                    dbrow = self.database.get_plugin_by_path(file_path)
                 except Exception:
                     dbrow = None
 
@@ -2999,7 +3867,7 @@ class PluginManagerApp(Tk):
                 result = row_get(row, "result") or {}
                 file_path = row_get(row, "file_path")
                 try:
-                    dbrow = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+                    dbrow = self.database.get_plugin_by_path(file_path)
                 except Exception:
                     dbrow = None
                 if dbrow is not None:
@@ -3093,7 +3961,7 @@ class PluginManagerApp(Tk):
         return result
 
     def download_updates_manually(self) -> None:
-        rows = self.database.list_plugins()
+        rows = self._filter_rows_for_selected_server(self.database.list_plugins())
         if not rows:
             messagebox.showinfo("対象なし", "ダウンロード対象の更新がありません。先に更新確認を実行してください。")
             return
@@ -3145,7 +4013,7 @@ class PluginManagerApp(Tk):
                 file_path = row_get(sel, "file_path")
                 dbrow = None
                 try:
-                    dbrow = self.database.connection.execute("SELECT * FROM plugins WHERE file_path = ?", (file_path,)).fetchone()
+                    dbrow = self.database.get_plugin_by_path(file_path)
                 except Exception:
                     dbrow = None
                 plugin_name = dbrow["plugin_name"] if dbrow else (row_get(result, "source_title") or file_path or "")
