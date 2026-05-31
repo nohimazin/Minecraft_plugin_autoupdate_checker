@@ -39,6 +39,8 @@ MODRINTH_VERSIONS_URL = "https://api.modrinth.com/v2/project/{project_id}/versio
 MODRINTH_PROJECT_PAGE_URL = "https://modrinth.com/plugin/{project_id}"
 MODRINTH_VERSION_PAGE_URL = "https://modrinth.com/plugin/{project_id}/version/{version_id}"
 USER_AGENT = "MinecraftPluginAutoUpdateChecker/1.0"
+REMOTE_OVERRIDES_ENV = "OVERRIDES_URL"
+REMOTE_OVERRIDES_SHA_ENV = "OVERRIDES_SHA256"
 MODRINTH_PROJECT_URL = "https://api.modrinth.com/v2/project/{project_id}"
 HANGAR_PROJECTS_URL = "https://hangar.papermc.io/api/v1/projects"
 HANGAR_PROJECT_URL = "https://hangar.papermc.io/api/v1/projects/{owner}/{slug}"
@@ -80,19 +82,74 @@ OVERRIDES: dict = {}
 
 def _load_overrides() -> None:
     global OVERRIDES
+    OVERRIDES = {}
+    def valid_schema(d: object) -> bool:
+        if not isinstance(d, dict):
+            return False
+        # keys should be strings and values should be mappings (dict)
+        for k, v in d.items():
+            if not isinstance(k, str):
+                return False
+            if not isinstance(v, dict):
+                return False
+        return True
+
+    # 1) Try remote URL from environment variable (optional). If provided, validate and cache.
+    url = os.environ.get(REMOTE_OVERRIDES_ENV, "").strip()
+    expected_sha = os.environ.get(REMOTE_OVERRIDES_SHA_ENV, "").strip()
+    if url:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+            if expected_sha:
+                sha = hashlib.sha256(raw).hexdigest()
+                if sha.lower() != expected_sha.lower():
+                    logging.warning("overrides: remote SHA mismatch (expected %s, got %s)", expected_sha, sha)
+                    raise ValueError("overrides sha mismatch")
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                logging.warning("overrides: remote content is not valid JSON")
+                raise
+            if valid_schema(data):
+                OVERRIDES = data
+                # cache to app dir for offline fallback
+                try:
+                    APP_DIR.mkdir(parents=True, exist_ok=True)
+                    cache_path = APP_DIR / "overrides.json"
+                    cache_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                except Exception:
+                    logging.exception("overrides: failed to write cache file")
+                return
+            else:
+                logging.warning("overrides: remote JSON failed schema validation")
+        except Exception:
+            logging.exception("overrides: failed to load remote overrides from %s", url)
+
+    # 2) Try repository-local overrides next to this script
     try:
         p = Path(__file__).parent / "overrides.json"
         if p.exists():
-            with p.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                if isinstance(data, dict):
-                    OVERRIDES = data
-                else:
-                    OVERRIDES = {}
-        else:
-            OVERRIDES = {}
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if valid_schema(data):
+                OVERRIDES = data
+                return
     except Exception:
-        OVERRIDES = {}
+        logging.exception("overrides: failed to load repository-local overrides")
+
+    # 3) Try cached overrides in app dir
+    try:
+        cache_path = APP_DIR / "overrides.json"
+        if cache_path.exists():
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if valid_schema(data):
+                OVERRIDES = data
+                return
+    except Exception:
+        logging.exception("overrides: failed to load cached overrides")
+
+    OVERRIDES = {}
 
 _load_overrides()
 
