@@ -64,6 +64,38 @@ SERVER_SOFTWARE_LOADERS = {
 }
 MODRINTH_PLUGIN_CATEGORIES = ["bukkit", "paper", "spigot", "bungeecord", "waterfall", "velocity", "purpur", "folia"]
 
+# Load optional overrides for preventing false-positive mappings and for provider/file-path hints.
+# Repository-distributed JSON file `overrides.json` (placed next to this script)
+# can contain entries keyed by normalized plugin name (normalize_modrinth_lookup output).
+# Example structure:
+# {
+#   "itemnbtapi": {
+#       "preferred_source": { "type": "modrinth", "id": "nbtapi", "url": "https://modrinth.com/plugin/nbtapi" },
+#       "spiget_ignore": ["222", "37"],
+#       "file_paths": ["listing://item-nbt-api-plugin-2.15.5.jar"],
+#       "file_name_prefixes": ["item-nbt-api-plugin"]
+#   }
+# }
+OVERRIDES: dict = {}
+
+def _load_overrides() -> None:
+    global OVERRIDES
+    try:
+        p = Path(__file__).parent / "overrides.json"
+        if p.exists():
+            with p.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    OVERRIDES = data
+                else:
+                    OVERRIDES = {}
+        else:
+            OVERRIDES = {}
+    except Exception:
+        OVERRIDES = {}
+
+_load_overrides()
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -331,6 +363,21 @@ def extract_jar_names_from_listing(listing_text: str) -> list[str]:
 def plugin_query_candidates(plugin_name: str, file_name: str | None = None) -> list[str]:
     candidates: list[str] = []
     seen: set[str] = set()
+    generic_tokens = {
+        "api",
+        "bukkit",
+        "floodgate",
+        "geyser",
+        "legacy",
+        "paper",
+        "paperplugin",
+        "platform",
+        "plugin",
+        "server",
+        "serverside",
+        "side",
+        "spigot",
+    }
 
     def add(value: str) -> None:
         normalized = re.sub(r"[\W_]+", " ", value).strip()
@@ -366,8 +413,12 @@ def plugin_query_candidates(plugin_name: str, file_name: str | None = None) -> l
         add(base.replace(" ", "-"))
         # add individual tokens (e.g., "GeyserMC" -> "Geyser", "MC")
         for token in re.split(r"[\s._-]+", base):
-            if token:
-                add(token)
+            cleaned_token = token.strip()
+            if not cleaned_token or len(cleaned_token) < 4:
+                continue
+            normalized_token = re.sub(r"[^0-9A-Za-z]+", "", cleaned_token).lower()
+            if normalized_token and normalized_token not in generic_tokens:
+                add(cleaned_token)
 
     return candidates
 
@@ -394,7 +445,16 @@ def http_json(url: str, params: dict[str, object] | None = None) -> dict:
 
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     with urllib.request.urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
+        raw = response.read().decode("utf-8")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # non-JSON response: return empty dict to avoid AttributeError on .get calls
+            return {}
+        # ensure we return a mapping or list; otherwise normalize to empty dict
+        if not isinstance(data, (dict, list)):
+            return {}
+        return data
 
 
 def download_file(url: str, destination: Path) -> None:
@@ -411,12 +471,21 @@ def search_modrinth_plugin(query: str) -> dict | None:
             "facets": json.dumps([[f"categories:{category}" for category in MODRINTH_PLUGIN_CATEGORIES]]),
         }
         data = http_json(MODRINTH_SEARCH_URL, params)
+        if not isinstance(data, dict):
+            return []
         hits = data.get("hits", [])
-        return [
-            hit
-            for hit in hits
-            if set(str(category).lower() for category in hit.get("categories", [])) & set(MODRINTH_PLUGIN_CATEGORIES)
-        ]
+        safe_hits: list[dict] = []
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            cats = hit.get("categories", []) or []
+            try:
+                cats_set = set(str(category).lower() for category in cats)
+            except Exception:
+                cats_set = set()
+            if cats_set & set(MODRINTH_PLUGIN_CATEGORIES):
+                safe_hits.append(hit)
+        return safe_hits
 
     def run_search_pass(base_query: str) -> dict | None:
         # Search only within Modrinth plugin projects.
@@ -432,6 +501,18 @@ def search_modrinth_plugin(query: str) -> dict | None:
                 slug = normalize_modrinth_lookup(str(hit.get("slug", "")))
                 if term_exact and (title == term_exact or slug == term_exact):
                     return hit
+                # stricter fuzzy matching: only allow containment when term is reasonably long
+                if term_exact and len(term_exact) >= 5:
+                    # token overlap check
+                    term_tokens = [t for t in re.split(r"[^0-9a-z]+", term_exact) if len(t) >= 3]
+                    title_tokens = [t for t in re.split(r"[^0-9a-z]+", title) if len(t) >= 3]
+                    slug_tokens = [t for t in re.split(r"[^0-9a-z]+", slug) if len(t) >= 3]
+                    if term_tokens and (set(term_tokens) & set(title_tokens)):
+                        if term_exact in title or title in term_exact:
+                            return hit
+                    if term_tokens and (set(term_tokens) & set(slug_tokens)):
+                        if term_exact in slug or slug in term_exact:
+                            return hit
 
         return None
 
@@ -518,6 +599,10 @@ def _best_loader_rank(item_loaders: list[str], preferred_loaders: list[str]) -> 
 
 def get_modrinth_release(project_id: str, server_version: str = "", server_software: str = "", version_channel: str = "release", source_title: str = "") -> dict | None:
     versions = http_json(MODRINTH_VERSIONS_URL.format(project_id=project_id))
+    if not isinstance(versions, list):
+        return None
+    # ensure each version entry is a dict
+    versions = [v for v in versions if isinstance(v, dict)]
     if not versions:
         return None
 
@@ -542,11 +627,11 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
             return False
         return True
 
-    matched_versions = [item for item in versions if version_matches(item)]
+    matched_versions = [item for item in versions if isinstance(item, dict) and version_matches(item)]
     if not matched_versions and not target_version and target_loaders:
-        matched_versions = [item for item in versions if any(loader in target_loaders for loader in [str(x).lower() for x in (item.get("loaders") or [])])]
+        matched_versions = [item for item in versions if isinstance(item, dict) and any(loader in target_loaders for loader in [str(x).lower() for x in (item.get("loaders") or [])])]
     if not matched_versions and not target_loaders:
-        plugin_pref_versions = [item for item in versions if _modrinth_is_plugin_loader_version(item)]
+        plugin_pref_versions = [item for item in versions if isinstance(item, dict) and _modrinth_is_plugin_loader_version(item)]
         matched_versions = plugin_pref_versions or versions
     if not matched_versions:
         return None
@@ -558,8 +643,13 @@ def get_modrinth_release(project_id: str, server_version: str = "", server_softw
         return (-_best_loader_rank(item_loaders, preferred_loaders), str(item.get("date_published", "")))
 
     latest = max(matched_versions, key=modrinth_sort_key)
+    if not isinstance(latest, dict):
+        return None
     files = latest.get("files", []) or []
-    download_url = files[0].get("url", "") if files else ""
+    if files and isinstance(files[0], dict):
+        download_url = files[0].get("url", "")
+    else:
+        download_url = ""
     return {
         "project_id": project_id,
         "title": latest.get("name") or latest.get("version_number") or project_id,
@@ -612,6 +702,8 @@ def search_hangar_project(query: str) -> dict | None:
     def search_once(term: str) -> list[dict]:
         params = {"query": term, "limit": 25, "offset": 0}
         data = http_json(HANGAR_PROJECTS_URL, params)
+        if not isinstance(data, dict):
+            return []
         return data.get("result", []) if isinstance(data, dict) else []
 
     def run_search_pass(base_query: str) -> dict | None:
@@ -623,6 +715,8 @@ def search_hangar_project(query: str) -> dict | None:
                 continue
 
             for hit in hits:
+                if not isinstance(hit, dict):
+                    continue
                 namespace = hit.get("namespace") or {}
                 title = normalize_modrinth_lookup(str(hit.get("name", "")))
                 slug = normalize_modrinth_lookup(str(namespace.get("slug", "")))
@@ -633,6 +727,23 @@ def search_hangar_project(query: str) -> dict | None:
                         "source_id": f"{namespace.get('owner', '')}/{namespace.get('slug', '')}".strip("/"),
                         "source_title": hit.get("name") or namespace.get("slug") or term,
                     }
+                # stricter fuzzy matching for Hangar: require longer term and token overlap for containment matches
+                if term_exact and len(term_exact) >= 5:
+                    term_tokens = [t for t in re.split(r"[^0-9a-z]+", term_exact) if len(t) >= 3]
+                    title_tokens = [t for t in re.split(r"[^0-9a-z]+", title) if len(t) >= 3]
+                    slug_tokens = [t for t in re.split(r"[^0-9a-z]+", slug) if len(t) >= 3]
+                    if term_tokens and (set(term_tokens) & set(title_tokens)) and (term_exact in title or title in term_exact):
+                        return {
+                            "source_type": "hangar",
+                            "source_id": f"{namespace.get('owner', '')}/{namespace.get('slug', '')}".strip("/"),
+                            "source_title": hit.get("name") or namespace.get("slug") or term,
+                        }
+                    if term_tokens and (set(term_tokens) & set(slug_tokens)) and (term_exact in slug or slug in term_exact):
+                        return {
+                            "source_type": "hangar",
+                            "source_id": f"{namespace.get('owner', '')}/{namespace.get('slug', '')}".strip("/"),
+                            "source_title": hit.get("name") or namespace.get("slug") or term,
+                        }
 
         return None
 
@@ -660,9 +771,15 @@ def get_hangar_release(project_ref: str, server_version: str = "", server_softwa
     limit = 100
     while True:
         data = http_json(HANGAR_PROJECT_VERSIONS_URL.format(owner=owner, slug=slug), {"limit": limit, "offset": offset})
-        page_versions = data.get("result", []) if isinstance(data, dict) else []
+        if not isinstance(data, dict):
+            page_versions = []
+            pagination = {}
+        else:
+            page_versions = data.get("result", []) or []
+            # ensure each page entry is a dict before using
+            page_versions = [v for v in page_versions if isinstance(v, dict)]
+            pagination = data.get("pagination", {}) or {}
         versions.extend(page_versions)
-        pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
         count = int(pagination.get("count", len(versions)) or len(versions))
         offset += limit
         if not page_versions or offset >= count:
@@ -831,6 +948,86 @@ def extract_spiget_resource_id(value: str) -> str:
     return ""
 
 
+def search_spiget_project(query: str) -> dict | None:
+    def search_once(term: str) -> list[dict]:
+        try:
+            data = http_json(f"https://api.spiget.org/v2/search/resources/{urllib.parse.quote(term)}")
+        except Exception:
+            return []
+        return data if isinstance(data, list) else []
+
+    def extract_result_ref(item: dict) -> tuple[str, str]:
+        resource_id = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        return resource_id, name
+
+    for term in plugin_query_candidates(query):
+        normalized_term = normalize_modrinth_lookup(term)
+        # check overrides for this normalized term
+        override = OVERRIDES.get(normalized_term, {})
+        try:
+            hits = search_once(term)
+        except Exception:
+            continue
+        for hit in hits:
+            resource_id, name = extract_result_ref(hit)
+            if not resource_id:
+                continue
+            # if overrides request a preferred (non-Spiget) source, skip Spiget mapping
+            if override and override.get("preferred_source"):
+                return None
+            normalized_name = normalize_modrinth_lookup(name)
+            # if overrides list specific spiget ids to ignore for this plugin, skip them
+            if override and isinstance(override.get("spiget_ignore"), list) and resource_id in [str(x) for x in override.get("spiget_ignore")]:
+                continue
+            if not normalized_term:
+                continue
+            # if the search term strongly indicates 'nbt', require the candidate name to mention 'nbt' too
+            if any(k in normalized_term for k in ("nbt", "nbtapi")) and not any(k in normalized_name for k in ("nbt", "nbtapi")):
+                continue
+            # require exact match or stronger substring match to avoid false positives
+            if normalized_term == normalized_name:
+                # prefer matching by core token (strip platform/version suffixes)
+                term_core = strip_platform_suffixes(term).lower()
+                name_core = strip_platform_suffixes(name).lower()
+                if term_core and name_core:
+                    if term_core != name_core and not (term_core in name_core or name_core in term_core):
+                        continue
+                else:
+                    # additional token-level sanity check to avoid accidental matches
+                    term_tokens = [t for t in re.split(r"[\s._-]+", term.lower()) if len(t) >= 3]
+                    name_tokens = [t for t in re.split(r"[\s._-]+", name.lower()) if len(t) >= 3]
+                    if term_tokens and name_tokens and not (set(term_tokens) & set(name_tokens)):
+                        # no shared meaningful tokens -> skip this hit
+                        continue
+                return {
+                    "source_type": "spiget",
+                    "source_id": resource_id,
+                    "source_title": name or term,
+                }
+            # only allow containment matches when both sides are reasonably long
+            if (len(normalized_term) >= 5 and len(normalized_name) >= 5) and (
+                normalized_term in normalized_name or normalized_name in normalized_term
+            ):
+                term_core = strip_platform_suffixes(term).lower()
+                name_core = strip_platform_suffixes(name).lower()
+                if term_core and name_core:
+                    if term_core != name_core and not (term_core in name_core or name_core in term_core):
+                        continue
+                else:
+                    term_tokens = [t for t in re.split(r"[\s._-]+", term.lower()) if len(t) >= 3]
+                    name_tokens = [t for t in re.split(r"[\s._-]+", name.lower()) if len(t) >= 3]
+                    if term_tokens and name_tokens and not (set(term_tokens) & set(name_tokens)):
+                        continue
+                return {
+                    "source_type": "spiget",
+                    "source_id": resource_id,
+                    "source_title": name or term,
+                }
+
+    return None
+
+
 def get_spiget_release(resource_ref: str, server_version: str = "", server_software: str = "") -> dict | None:
     ref = extract_spiget_resource_id(resource_ref)
     if not ref:
@@ -846,7 +1043,7 @@ def get_spiget_release(resource_ref: str, server_version: str = "", server_softw
     except Exception:
         versions = []
 
-    if not versions:
+    if not isinstance(versions, list) or not versions:
         # if no versions, still return basic resource info
         title = resource.get("name") or resource.get("title") or str(ref)
         return {
@@ -884,6 +1081,133 @@ def get_spiget_release(resource_ref: str, server_version: str = "", server_softw
         "matched_server_version": (server_version or "").strip(),
         "matched_server_software": normalize_server_software(server_software),
     }
+
+
+def check_target_compatibility(row_or_name, target_server_version: str, target_server_software: str) -> dict:
+    """Check if a plugin (row/dict or name string) has a release compatible with the given target server version/software.
+
+    Returns a dict with keys:
+      - compatible: bool
+      - source_type, source_id, source_title
+      - matched_version, matched_download_url
+      - reason: a short explanation when not compatible
+    """
+    # accept either a row-like object or a bare plugin name
+    if isinstance(row_or_name, (str,)):
+        plugin_name = row_or_name
+        stored_source_type = ""
+        stored_source_id = ""
+        stored_source_title = ""
+    else:
+        plugin_name = row_get(row_or_name, "plugin_name") or row_get(row_or_name, "file_name") or ""
+        stored_source_type = normalize_source_type(row_get(row_or_name, "source_type") or "")
+        stored_source_id = row_get(row_or_name, "source_id") or ""
+        stored_source_title = row_get(row_or_name, "source_title") or ""
+
+    target_version = (target_server_version or "").strip()
+    target_software = (target_server_software or "").strip()
+
+    def build_result(ok: bool, s_type: str, s_id: str, s_title: str, rel: dict | None, reason: str = "") -> dict:
+        return {
+            "compatible": bool(ok),
+            "source_type": s_type,
+            "source_id": s_id,
+            "source_title": s_title,
+            "matched_version": rel.get("version") if rel else "",
+            "matched_download_url": rel.get("download_url") if rel else "",
+            "reason": reason,
+        }
+
+    # If a stored explicit source exists, prefer checking it first
+    if stored_source_type and stored_source_id:
+        s_type = stored_source_type
+        s_id = stored_source_id
+        s_title = stored_source_title or plugin_name
+        if s_type == "modrinth":
+            pid = ensure_modrinth_project_id(s_id)
+            if pid:
+                try:
+                    rel = get_modrinth_release(pid, server_version=target_version, server_software=target_software)
+                except Exception as exc:
+                    return build_result(False, "modrinth", pid, s_title, None, f"チェック中に例外が発生 (Modrinth): {exc}")
+                if rel:
+                    return build_result(True, "modrinth", pid, s_title, rel)
+                return build_result(False, "modrinth", pid, s_title, None, "互換する Modrinth リリースが見つかりませんでした")
+        elif s_type == "hangar":
+            ref = extract_hangar_project_ref(s_id)
+            if ref:
+                try:
+                    rel = get_hangar_release(ref, server_version=target_version, server_software=target_software)
+                except Exception as exc:
+                    return build_result(False, "hangar", ref, s_title, None, f"チェック中に例外が発生 (Hangar): {exc}")
+                if rel:
+                    return build_result(True, "hangar", ref, s_title, rel)
+                return build_result(False, "hangar", ref, s_title, None, "互換する Hangar リリースが見つかりませんでした")
+        elif s_type == "spiget":
+            rid = extract_spiget_resource_id(s_id)
+            if rid:
+                try:
+                    rel = get_spiget_release(rid, server_version=target_version, server_software=target_software)
+                except Exception as exc:
+                    return build_result(False, "spiget", rid, s_title, None, f"チェック中に例外が発生 (Spiget): {exc}")
+                if rel:
+                    return build_result(True, "spiget", rid, s_title, rel)
+                return build_result(False, "spiget", rid, s_title, None, "互換する Spiget リリースが見つかりませんでした")
+        elif s_type == "github":
+            repo = extract_github_repo_ref(s_id)
+            if repo:
+                try:
+                    rel = get_github_release(repo, server_version=target_version, server_software=target_software)
+                except Exception as exc:
+                    return build_result(False, "github", repo, s_title, None, f"チェック中に例外が発生 (GitHub): {exc}")
+                if rel:
+                    return build_result(True, "github", repo, s_title, rel)
+                return build_result(False, "github", repo, s_title, None, "互換する GitHub リリースが見つかりませんでした")
+
+    # Name-based search in preferred order: Modrinth -> Hangar -> Spiget
+    # 1) Modrinth
+    try:
+        hit = search_modrinth_plugin(plugin_name)
+    except Exception as exc:
+        return build_result(False, "", "", plugin_name, None, f"検索中に例外が発生 (Modrinth): {exc}")
+    if hit and isinstance(hit, dict) and hit.get("project_id"):
+        pid = hit.get("project_id")
+        try:
+            rel = get_modrinth_release(pid, server_version=target_version, server_software=target_software)
+        except Exception as exc:
+            return build_result(False, "modrinth", pid, hit.get("title") or hit.get("slug") or plugin_name, None, f"リリース取得中に例外が発生 (Modrinth): {exc}")
+        if rel:
+            return build_result(True, "modrinth", pid, hit.get("title") or hit.get("slug") or plugin_name, rel)
+
+    # 2) Hangar
+    try:
+        hit = search_hangar_project(plugin_name)
+    except Exception as exc:
+        return build_result(False, "", "", plugin_name, None, f"検索中に例外が発生 (Hangar): {exc}")
+    if hit and isinstance(hit, dict) and hit.get("source_id"):
+        ref = hit.get("source_id")
+        try:
+            rel = get_hangar_release(ref, server_version=target_version, server_software=target_software)
+        except Exception as exc:
+            return build_result(False, "hangar", ref, hit.get("source_title") or plugin_name, None, f"リリース取得中に例外が発生 (Hangar): {exc}")
+        if rel:
+            return build_result(True, "hangar", ref, hit.get("source_title") or plugin_name, rel)
+
+    # 3) Spiget
+    try:
+        hit = search_spiget_project(plugin_name)
+    except Exception as exc:
+        return build_result(False, "", "", plugin_name, None, f"検索中に例外が発生 (Spiget): {exc}")
+    if hit and isinstance(hit, dict) and hit.get("source_id"):
+        rid = hit.get("source_id")
+        try:
+            rel = get_spiget_release(rid, server_version=target_version, server_software=target_software)
+        except Exception as exc:
+            return build_result(False, "spiget", rid, hit.get("source_title") or plugin_name, None, f"リリース取得中に例外が発生 (Spiget): {exc}")
+        if rel:
+            return build_result(True, "spiget", rid, hit.get("source_title") or plugin_name, rel)
+
+    return build_result(False, "", "", plugin_name, None, "指定ターゲットに適合するリリースが見つかりません")
 
 
 def allowed_modrinth_version_types(channel: str) -> set[str]:
@@ -928,6 +1252,21 @@ def format_source_label(source_type: str | None, source_title: str | None, sourc
     if source_id:
         return str(source_id)
     return "-"
+
+
+def format_source_label_for_row(row: sqlite3.Row | dict | None) -> str:
+    if row is None:
+        return "-"
+    source_type = row_get(row, "source_type", "")
+    source_title = row_get(row, "source_title", "")
+    source_id = row_get(row, "source_id", "")
+    last_error = str(row_get(row, "last_error") or "").strip()
+    label = format_source_label(source_type, source_title, source_id)
+    if last_error:
+        if label == "-":
+            return "未確定"
+        return f"候補: {label}"
+    return label
 
 
 def build_source_url(source_type: str | None, source_id: str | None) -> str:
@@ -1931,6 +2270,14 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
+        # compatibility check button placed to the right of the concurrency spinbox
+        compat_btn = ttk.Button(server_frame, text="互換性チェック", command=lambda: self._on_check_compatibility_clicked())
+        compat_btn.pack(side=LEFT, padx=(0, 8), pady=8)
+        try:
+            _attach_tooltip(compat_btn, "登録されたプラグインが特定のバージョンに対応しているかを確認します。")
+        except Exception:
+            pass
+
         self.server_version.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.server_software.trace_add("write", lambda *args: self._schedule_server_settings_save())
         self.concurrency_workers.trace_add("write", lambda *args: self._schedule_server_settings_save())
@@ -2156,6 +2503,12 @@ class PluginManagerApp(Tk):
                     return
                 try:
                     widget.event_generate("<<Cut>>")
+                except Exception:
+                    pass
+
+            def copy() -> None:
+                try:
+                    widget.event_generate("<<Copy>>")
                 except Exception:
                     pass
 
@@ -2840,6 +3193,280 @@ class PluginManagerApp(Tk):
             messagebox.showinfo("対象なし", "先に一覧のプラグインを1件選択してください。")
         return row
 
+    def _on_check_compatibility_clicked(self) -> None:
+        try:
+            sid = int(self.selected_server_id.get() or 0)
+        except Exception:
+            sid = 0
+        if sid == 0:
+            messagebox.showinfo("サーバー未選択", "先にサーバーを選択してください。", parent=self)
+            return
+
+        default_version, default_software = self._get_server_context()
+
+        target_version = simpledialog.askstring("ターゲットバージョン", "ターゲットのサーバーバージョンを入力してください（例: 1.21.11）", initialvalue=default_version, parent=self)
+        if target_version is None:
+            return
+
+        target_software = simpledialog.askstring("ターゲットソフト", "ターゲットのサーバーソフトを入力してください（例: Paper）", initialvalue=default_software, parent=self)
+        if target_software is None:
+            return
+
+        rows = self.database.list_plugins()
+        if not rows:
+            messagebox.showinfo("プラグインなし", "このサーバーにはプラグインが登録されていません。", parent=self)
+            return
+
+        # create result window and tree now so we can incrementally populate it
+        win = tk.Toplevel(self)
+        win.title(f"互換性チェック結果 - サーバー {sid}")
+        win.geometry("900x520")
+
+        top_frame = ttk.Frame(win)
+        top_frame.pack(fill=X, padx=6, pady=6)
+        status_label = ttk.Label(top_frame, text=f"Target: {target_version} / {target_software}    全{len(rows)}個中0個が非対応です")
+        status_label.pack(side=LEFT)
+        ttk.Label(top_frame, text="フィルタ:").pack(side=LEFT, padx=(12, 4))
+        filter_var = StringVar()
+        filter_entry = ttk.Entry(top_frame, textvariable=filter_var)
+        filter_entry.pack(side=LEFT, fill=X, expand=True)
+
+        container = ttk.Frame(win)
+        container.pack(fill=BOTH, expand=True, padx=6, pady=(0,6))
+
+        columns = ("plugin", "status", "source", "matched", "reason", "url")
+        tree = ttk.Treeview(container, columns=columns, show="headings")
+
+        # sorting state and functions
+        heading_map = {
+            "plugin": "プラグイン",
+            "status": "状態",
+            "source": "提供元",
+            "matched": "マッチ版",
+            "reason": "理由",
+            "url": "ダウンロードURL",
+        }
+
+        _current_sort_col: str | None = None
+        _current_sort_reverse: bool = False
+
+        def apply_sort(col: str, reverse: bool) -> None:
+            nonlocal _current_sort_col, _current_sort_reverse
+            items = list(tree.get_children(''))
+            def key_fn(iid):
+                try:
+                    v = tree.set(iid, col) or ""
+                except Exception:
+                    v = ""
+                if col == 'status':
+                    return 0 if str(v).upper() == 'OK' else 1
+                return str(v).lower()
+            items.sort(key=key_fn, reverse=reverse)
+            for idx, iid in enumerate(items):
+                tree.move(iid, '', idx)
+            _current_sort_col = col
+            _current_sort_reverse = bool(reverse)
+            # update header texts with indicator
+            for c in columns:
+                base = heading_map.get(c, c)
+                arrow = ''
+                if _current_sort_col == c:
+                    arrow = ' ▼' if _current_sort_reverse else ' ▲'
+                try:
+                    tree.heading(c, text=base + arrow, command=lambda cc=c: sort_by_column(cc))
+                except Exception:
+                    pass
+
+        def sort_by_column(col: str) -> None:
+            nonlocal _current_sort_col, _current_sort_reverse
+            if _current_sort_col == col:
+                reverse = not _current_sort_reverse
+            else:
+                # default for status column: show NG (非互換) at top -> descending
+                reverse = True if col == 'status' else False
+            apply_sort(col, reverse)
+
+        # initialize headings
+        for c in columns:
+            tree.heading(c, text=heading_map.get(c, c), command=lambda cc=c: sort_by_column(cc))
+
+        vsb = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(win, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.pack(side=LEFT, fill=BOTH, expand=True)
+        vsb.pack(side=RIGHT, fill=Y)
+        hsb.pack(side=BOTTOM, fill=X)
+
+        all_items: list[tuple[str, dict]] = []
+
+        def autosize_columns() -> None:
+            try:
+                import tkinter.font as tkfont
+
+                try:
+                    f = tkfont.nametofont(tree.cget("font"))
+                except Exception:
+                    f = tkfont.Font()
+            except Exception:
+                f = None
+
+            for col in columns:
+                try:
+                    header = tree.heading(col).get("text") or col
+                except Exception:
+                    header = col
+                if f:
+                    max_w = f.measure(header) + 16
+                else:
+                    max_w = max(100, len(str(header)) * 8 + 16)
+                for iid in tree.get_children():
+                    try:
+                        val = str(tree.set(iid, col) or "")
+                    except Exception:
+                        val = ""
+                    if f:
+                        w = f.measure(val) + 12
+                    else:
+                        w = len(val) * 8 + 12
+                    if w > max_w:
+                        max_w = w
+                try:
+                    tree.column(col, width=max_w, minwidth=50)
+                except Exception:
+                    pass
+
+        def add_row_to_tree(name: str, res) -> None:
+            # coerce non-dict results to a safe dict
+            if not isinstance(res, dict):
+                res = {"compatible": False, "reason": str(res)}
+            status = "OK" if bool(res.get("compatible")) else "NG"
+            src = res.get("source_type") or "-"
+            matched = res.get("matched_version") or "-"
+            url = res.get("matched_download_url") or ""
+            reason = res.get("reason") or ""
+            tree.insert("", "end", values=(name, status, src, matched, reason, url))
+            try:
+                autosize_columns()
+            except Exception:
+                pass
+            try:
+                # reapply current sort so NG/OK ordering is maintained as rows are added
+                if _current_sort_col:
+                    apply_sort(_current_sort_col, _current_sort_reverse)
+            except Exception:
+                pass
+
+        def on_double_click(event):
+            sel = tree.selection()
+            if not sel:
+                return
+            vals = tree.item(sel[0]).get("values") or []
+            if len(vals) >= 6 and vals[5]:
+                try:
+                    webbrowser.open(vals[5])
+                except Exception:
+                    pass
+
+        tree.bind('<Double-1>', on_double_click)
+
+        # filtering
+        def apply_filter():
+            term = (filter_var.get() or "").strip().lower()
+            for iid in tree.get_children():
+                vals = tree.item(iid).get("values") or []
+                combined = "\t".join(str(v) for v in vals[:4] + vals[4:5]).lower()
+                tree.item(iid, tags=() )
+                if term and term not in combined:
+                    tree.detach(iid)
+                else:
+                    try:
+                        tree.reattach(iid, '', 'end')
+                    except Exception:
+                        pass
+
+        filter_var.trace_add("write", lambda *_: apply_filter())
+
+        # background worker
+        total = len(rows)
+        self._set_progress(0, total, "互換性チェックを開始しています...")
+        self._set_busy("互換性チェック実行中...")
+        try:
+            status_label.configure(text=f"Target: {target_version} / {target_software}    確認中: 0/{total} をチェック中")
+        except Exception:
+            pass
+
+        def worker():
+            compatible_count = 0
+            for idx, r in enumerate(rows, start=1):
+                name = row_get(r, "plugin_name") or row_get(r, "file_name") or "(unknown)"
+                try:
+                    res = check_target_compatibility(r, target_version, target_software)
+                except Exception as exc:
+                    tb = traceback.format_exc()
+                    message = f"チェック中に例外: {exc}\n{tb}"
+                    try:
+                        self._log(f"互換性チェック例外: {name} -> {exc}")
+                        self._log(tb)
+                    except Exception:
+                        pass
+                    res = {"compatible": False, "reason": message}
+
+                # coerce to dict if some provider returned a raw string
+                if not isinstance(res, dict):
+                    res = {"compatible": False, "reason": str(res)}
+
+                all_items.append((name, res))
+
+                compatible_count_local = 1 if bool(res.get("compatible")) else 0
+
+                # schedule UI update
+                def sched_add(n=name, rr=res, i=idx, cc=compatible_count_local):
+                    add_row_to_tree(n, rr)
+                    # update main progress
+                    try:
+                        self._set_progress(i, total, f"{i}/{total} をチェック中: {n}")
+                    except Exception:
+                        pass
+                    # update status label
+                    try:
+                        # compute current compatible count from tree items
+                        ok_count = sum(1 for item in tree.get_children() if tree.set(item, "status") == "OK")
+                        # show checking text while in-progress
+                        status_label.configure(text=f"Target: {target_version} / {target_software}    確認中: {i}/{total} をチェック中")
+                    except Exception:
+                        pass
+
+                self.after(0, sched_add)
+                time.sleep(0.01)
+
+            # finished
+            def finish():
+                try:
+                    self._set_busy("")
+                    self._set_progress(total, total, "互換性チェック完了")
+                except Exception:
+                    pass
+                try:
+                    ok_count = sum(1 for item in tree.get_children() if tree.set(item, 'status') == 'OK')
+                    ng = max(0, total - ok_count)
+                    status_label.configure(text=f"Target: {target_version} / {target_software}    全{total}個中{ng}個が非対応です")
+                except Exception:
+                    pass
+                try:
+                    autosize_columns()
+                except Exception:
+                    pass
+
+            self.after(0, finish)
+
+        # set default sort to status descending (NG first) and apply after items start appearing
+        # we set current sort so add_row_to_tree will reapply it
+        _current_sort_col = 'status'
+        _current_sort_reverse = True
+
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
+
     def _is_match_failure(self, row: sqlite3.Row) -> bool:
         last_error = str(row_get(row, "last_error") or "")
         return bool(last_error.strip())
@@ -3371,7 +3998,7 @@ class PluginManagerApp(Tk):
                         row_get(row, "current_version", ""),
                         row_get(row, "latest_version", ""),
                         row_get(row, "last_checked", ""),
-                        format_source_label(row_get(row, "source_type"), row_get(row, "source_title"), row_get(row, "source_id")),
+                        format_source_label_for_row(row),
                         build_source_url(row_get(row, "source_type"), row_get(row, "source_id")),
                         row_get(row, "file_name", ""),
                         row_get(row, "file_path", ""),
@@ -3488,7 +4115,7 @@ class PluginManagerApp(Tk):
         if selected is None:
             lines = ["上の一覧からプラグインを選択してください。"]
         else:
-            source = format_source_label(row_get(selected, "source_type"), row_get(selected, "source_title"), row_get(selected, "source_id"))
+            source = format_source_label_for_row(selected)
             latest_version = str(row_get(selected, "latest_version") or "-")
             current_version = str(row_get(selected, "current_version") or "-")
             last_checked = str(row_get(selected, "last_checked") or "-")
@@ -3722,7 +4349,7 @@ class PluginManagerApp(Tk):
         self.row_index = {str(row["file_path"]): row for row in rows}
 
         for index, row in enumerate(rows, start=1):
-            source = format_source_label(row_get(row, "source_type"), row_get(row, "source_title"), row_get(row, "source_id"))
+            source = format_source_label_for_row(row)
 
             img = None
             try:
@@ -3779,6 +4406,96 @@ class PluginManagerApp(Tk):
             fpath = str(row.get("file_path", ""))
         self._log(f"Resolve start: {pname} ({fpath}) -- stored source_type={row_get(row, 'source_type')} source_id={row_get(row, 'source_id')}")
 
+        # Check overrides by normalized name, file_path, or filename prefix to force preferred source
+        override = None
+        try:
+            norm_name = normalize_modrinth_lookup(pname)
+            fname = Path(str(fpath)).name.lower()
+            for key, val in OVERRIDES.items():
+                if key == norm_name:
+                    override = val
+                    break
+                # match explicit file_paths
+                if isinstance(val.get("file_paths"), list) and fpath and fpath in val.get("file_paths"):
+                    override = val
+                    break
+                # match filename prefixes
+                if isinstance(val.get("file_name_prefixes"), list) and fname:
+                    stem = Path(fname).stem.lower()
+                    for pref in val.get("file_name_prefixes"):
+                        try:
+                            p = pref.lower()
+                            # strict prefix match: stem == p or stem starts with p followed by a separator (-, _, .)
+                            if stem == p or any(stem.startswith(p + sep) for sep in ("-", "_", ".")):
+                                override = val
+                                break
+                        except Exception:
+                            continue
+                    if override:
+                        break
+        except Exception:
+            override = None
+
+        if override and isinstance(override.get("preferred_source"), dict):
+            ps = override.get("preferred_source")
+            resolved_source_type = normalize_source_type(ps.get("type")) or resolved_source_type
+            resolved_source_id = ps.get("id") or resolved_source_id
+            resolved_title = ps.get("url") or ps.get("id") or resolved_title
+
+        def no_update_result() -> dict:
+            return {
+                "source_type": resolved_source_type,
+                "source_id": resolved_source_id,
+                "source_title": resolved_title,
+                "latest_version": current_version,
+                "latest_download_url": "",
+                "update_available": 0,
+                "last_checked": now_iso(),
+                "last_error": "",
+            }
+
+        def try_spiget_name_fallback() -> dict | None:
+            nonlocal resolved_source_type, resolved_source_id, resolved_title
+            base_name = row_get(row, "plugin_name") or resolved_title or pname or row_get(row, "file_name") or ""
+            if not base_name:
+                return None
+            modrinth_hit = search_modrinth_plugin(base_name)
+            if modrinth_hit and modrinth_hit.get("project_id"):
+                resolved_source_type = "modrinth"
+                resolved_source_id = modrinth_hit.get("project_id", "")
+                resolved_title = modrinth_hit.get("title") or modrinth_hit.get("slug") or base_name
+                self._log(f"Fallback: Modrinth hit for '{base_name}' -> {resolved_source_id}")
+                if not resolved_source_id:
+                    return None
+                release = get_modrinth_release(
+                    resolved_source_id,
+                    server_version=server_version,
+                    server_software=server_software,
+                    version_channel=self._get_modrinth_version_channel(),
+                    source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
+                )
+                if release:
+                    return release
+            hangar_hit = search_hangar_project(base_name)
+            if hangar_hit and hangar_hit.get("source_id"):
+                resolved_source_type = "hangar"
+                resolved_source_id = hangar_hit.get("source_id", "")
+                resolved_title = hangar_hit.get("source_title") or base_name
+                self._log(f"Fallback: Hangar hit for '{base_name}' -> {resolved_source_id}")
+                release = get_hangar_release(resolved_source_id, server_version=server_version, server_software=server_software)
+                if release:
+                    return release
+            hit = search_spiget_project(base_name)
+            if not hit:
+                return None
+            resolved_source_type = "spiget"
+            resolved_source_id = hit.get("source_id", "")
+            resolved_title = hit.get("source_title") or base_name
+            self._log(f"Fallback: Spiget hit for '{base_name}' -> {resolved_source_id}")
+            if not resolved_source_id:
+                return None
+            return get_spiget_release(resolved_source_id, server_version=server_version, server_software=server_software)
+
         try:
             if resolved_source_type == "modrinth" and resolved_source_id:
                 project_id = ensure_modrinth_project_id(resolved_source_id)
@@ -3803,9 +4520,14 @@ class PluginManagerApp(Tk):
                     source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                 )
                 if not release:
-                    raise RuntimeError(
-                        f"指定条件に対応するModrinth版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
-                    )
+                    # if override explicitly set a preferred_source, do NOT fallback to other providers
+                    if override and isinstance(override.get("preferred_source"), dict):
+                        self._log(f"Preferred source set by overrides but no release found for {resolved_title or project_id}; treating as no update")
+                        return no_update_result()
+                    release = try_spiget_name_fallback()
+                    if not release:
+                        self._log(f"互換する Modrinth リリースが見つかりませんでした: {resolved_title or project_id} → 更新対象なしとして扱います")
+                        return no_update_result()
             elif resolved_source_type == "hangar" and resolved_source_id:
                 project_ref = extract_hangar_project_ref(resolved_source_id)
                 self._log(f"Hangar branch: resolved_source_id={resolved_source_id} -> project_ref={project_ref}")
@@ -3823,9 +4545,13 @@ class PluginManagerApp(Tk):
                 resolved_source_id = project_ref
                 release = get_hangar_release(project_ref, server_version=server_version, server_software=server_software)
                 if not release:
-                    raise RuntimeError(
-                        f"指定条件に対応するHangar版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
-                    )
+                    if override and isinstance(override.get("preferred_source"), dict):
+                        self._log(f"Preferred source set by overrides but no release found for {resolved_title or project_ref}; treating as no update")
+                        return no_update_result()
+                    release = try_spiget_name_fallback()
+                    if not release:
+                        self._log(f"互換する Hangar リリースが見つかりませんでした: {resolved_title or project_ref} → 更新対象なしとして扱います")
+                        return no_update_result()
             elif resolved_source_type == "github" and resolved_source_id:
                 repo_ref = extract_github_repo_ref(resolved_source_id)
                 self._log(f"GitHub branch: resolved_source_id={resolved_source_id} -> repo_ref={repo_ref}")
@@ -3843,9 +4569,13 @@ class PluginManagerApp(Tk):
                 resolved_source_id = repo_ref
                 release = get_github_release(repo_ref, server_version=server_version, server_software=server_software)
                 if not release:
-                    raise RuntimeError(
-                        f"指定条件に対応するGitHub Releaseが見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
-                    )
+                    if override and isinstance(override.get("preferred_source"), dict):
+                        self._log(f"Preferred source set by overrides but no release found for {resolved_title or repo_ref}; treating as no update")
+                        return no_update_result()
+                    release = try_spiget_name_fallback()
+                    if not release:
+                        self._log(f"互換する GitHub リリースが見つかりませんでした: {resolved_title or repo_ref} → 更新対象なしとして扱います")
+                        return no_update_result()
             elif resolved_source_type == "spiget" and resolved_source_id:
                 resource_id = extract_spiget_resource_id(resolved_source_id)
                 self._log(f"Spiget branch: resolved_source_id={resolved_source_id} -> resource_id={resource_id}")
@@ -3863,19 +4593,23 @@ class PluginManagerApp(Tk):
                 resolved_source_id = resource_id
                 release = get_spiget_release(resource_id, server_version=server_version, server_software=server_software)
                 if not release:
-                    raise RuntimeError(
-                        f"指定条件に対応するSpiget版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
-                    )
+                    if override and isinstance(override.get("preferred_source"), dict):
+                        self._log(f"Preferred source set by overrides but no release found for {resolved_title or resource_id}; treating as no update")
+                        return no_update_result()
+                    release = try_spiget_name_fallback()
+                    if not release:
+                        self._log(f"互換する Spiget リリースが見つかりませんでした: {resolved_title or resource_id} → 更新対象なしとして扱います")
+                        return no_update_result()
             else:
                 self._log(f"Fallback: searching Modrinth for '{row_get(row, 'plugin_name')}'")
                 hit = search_modrinth_plugin(row["plugin_name"])
                 if hit:
-                    self._log(f"Fallback: Modrinth hit for '{row_get(row, 'plugin_name')}' -> {hit.get('project_id') or hit.get('slug') or hit.get('title')}" )
+                    self._log(f"Fallback: Modrinth hit for '{row_get(row, 'plugin_name')}' -> {hit.get('project_id') or hit.get('slug') or hit.get('title')}")
                 else:
                     self._log(f"Fallback: Modrinth missed for '{row_get(row, 'plugin_name')}', trying Hangar")
                     hit = search_hangar_project(row["plugin_name"])
                     if hit:
-                        self._log(f"Fallback: Hangar hit for '{row_get(row, 'plugin_name')}' -> {hit.get('source_id')}" )
+                        self._log(f"Fallback: Hangar hit for '{row_get(row, 'plugin_name')}' -> {hit.get('source_id')}")
                 if hit:
                     if hit.get("source_type") == "hangar":
                         resolved_source_type = "hangar"
@@ -3895,9 +4629,8 @@ class PluginManagerApp(Tk):
                             source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                         )
                     if not release:
-                        raise RuntimeError(
-                            f"指定条件に対応する{resolved_source_type.capitalize()}版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
-                        )
+                        self._log(f"互換する {resolved_source_type.capitalize()} リリースが見つかりませんでした: {resolved_title or resolved_source_id or pname} → 更新対象なしとして扱います")
+                        return no_update_result()
                 else:
                     spiget_candidate = (
                         extract_spiget_resource_id(resolved_source_id)
@@ -3910,20 +4643,23 @@ class PluginManagerApp(Tk):
                         resolved_source_id = spiget_candidate
                         release = get_spiget_release(spiget_candidate, server_version=server_version, server_software=server_software)
                         if not release:
-                            raise RuntimeError(
-                                f"指定条件に対応するSpiget版が見つかりませんでした: {server_software or '自動'} / {server_version or '-'}"
-                            )
+                            release = try_spiget_name_fallback()
+                            if not release:
+                                self._log(f"互換する Spiget リリースが見つかりませんでした: {resolved_title or spiget_candidate} → 更新対象なしとして扱います")
+                                return no_update_result()
                     else:
-                        return {
-                            "source_type": resolved_source_type,
-                            "source_id": resolved_source_id,
-                            "source_title": resolved_title,
-                            "latest_version": latest_version,
-                            "latest_download_url": latest_download_url,
-                            "update_available": 0,
-                            "last_checked": now_iso(),
-                            "last_error": "配布サイト未対応または未検出",
-                        }
+                        release = try_spiget_name_fallback()
+                        if not release:
+                            return {
+                                "source_type": resolved_source_type,
+                                "source_id": resolved_source_id,
+                                "source_title": resolved_title,
+                                "latest_version": latest_version,
+                                "latest_download_url": latest_download_url,
+                                "update_available": 0,
+                                "last_checked": now_iso(),
+                                "last_error": "配布サイト未対応または未検出",
+                            }
 
             latest_version = release["version"]
             latest_download_url = release["download_url"]
