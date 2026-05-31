@@ -1,0 +1,40 @@
+{
+  "itemnbtapi": {
+    "preferred_source": {
+      "type": "modrinth",
+      "id": "nbtapi",
+      "url": "https://modrinth.com/plugin/nbtapi"
+    },
+    "spiget_ignore": ["222", "37"],
+    "file_paths": ["listing://item-nbt-api-plugin-2.15.5.jar"],
+    "file_name_prefixes": ["item-nbt-api-plugin"]
+  },
+  "itemnbtapiplugin": {
+    "preferred_source": {
+      "type": "modrinth",
+      "id": "nbtapi",
+      "url": "https://modrinth.com/plugin/nbtapi"
+    },
+    "spiget_ignore": ["222", "37"],
+    "file_name_prefixes": ["item-nbt-api-plugin"]
+  },
+  "nbtapi": {
+    "preferred_source": {
+      "type": "modrinth",
+      "id": "nbtapi",
+      "url": "https://modrinth.com/plugin/nbtapi"
+    },
+    "file_name_prefixes": ["nbt-api", "nbtapi"]
+  }
+  ,
+  "floodgatespigot": {
+    "preferred_source": {
+      "type": "hangar",
+      "id": "GeyserMC/Floodgate",
+      "url": "https://hangar.papermc.io/GeyserMC/Floodgate"
+    },
+    "file_paths": ["listing://floodgate-spigot.jar"],
+    "spiget_ignore": ["82278"],
+    "file_name_prefixes": ["floodgate-spigot"]
+  }
+}
