@@ -92,8 +92,3 @@ python app.py
 
 運用例:
 - item-nbt-api-plugin のように短いトークンで誤判定を受けやすいプラグインは、`normalized` キー（例: `itemnbtapi` や `nbtapi`）を作り、`preferred_source` に Modrinth の project id と URL を設定しておくと安心です。
-
-セキュリティ/運用上の注意:
-- このファイルはローカルで編集してカスタム運用することを想定しています。配布用にコミットする場合は、公開して問題ない設定のみを含めてください（プライベート情報は含めないでください）。
-
-必要なら、README に `overrides.json` の編集例や自動生成スクリプトのテンプレートを追加します。希望があれば教えてください。
