@@ -4415,18 +4415,48 @@ class PluginManagerApp(Tk):
                 if key == norm_name:
                     override = val
                     break
-                # match explicit file_paths
-                if isinstance(val.get("file_paths"), list) and fpath and fpath in val.get("file_paths"):
-                    override = val
-                    break
+                # match explicit file_paths (allow basename/suffix variants)
+                if isinstance(val.get("file_paths"), list) and fpath:
+                    try:
+                        fpath_norm = str(fpath).lower()
+                        fbasename = Path(fpath_norm).name
+                        for fp in val.get("file_paths"):
+                            if not fp:
+                                continue
+                            fp_norm = str(fp).lower()
+                            # direct equality
+                            if fp_norm == fpath_norm:
+                                override = val
+                                break
+                            # compare basenames (listing://foo.jar vs /some/path/foo.jar)
+                            if Path(fp_norm).name == fbasename:
+                                override = val
+                                break
+                            # allow listing:// variants: compare suffix after scheme
+                            if fp_norm.startswith("listing://") and fbasename == Path(fp_norm.replace("listing://", "")).name:
+                                override = val
+                                break
+                        if override:
+                            break
+                    except Exception:
+                        pass
                 # match filename prefixes
                 if isinstance(val.get("file_name_prefixes"), list) and fname:
                     stem = Path(fname).stem.lower()
                     for pref in val.get("file_name_prefixes"):
                         try:
-                            p = pref.lower()
-                            # strict prefix match: stem == p or stem starts with p followed by a separator (-, _, .)
-                            if stem == p or any(stem.startswith(p + sep) for sep in ("-", "_", ".")):
+                            p = str(pref).lower().strip()
+                            if not p:
+                                continue
+                            # skip very short tokens to avoid false positives
+                            if len(p) < 3:
+                                continue
+                            # exact or startswith match on stem
+                            if stem == p or stem.startswith(p) or stem.startswith(p + "-") or stem.startswith(p + "_"):
+                                override = val
+                                break
+                            # allow longer prefix contained in stem (but require prefix length >=5)
+                            if len(p) >= 5 and p in stem:
                                 override = val
                                 break
                         except Exception:
