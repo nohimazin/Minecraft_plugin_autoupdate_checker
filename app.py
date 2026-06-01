@@ -24,6 +24,11 @@ import tkinter as tk
 from tkinter import BOTH, BOTTOM, END, LEFT, RIGHT, X, Y, DoubleVar, Tk, StringVar, filedialog, messagebox, simpledialog, ttk
 
 try:
+    import winsound
+except Exception:
+    winsound = None
+
+try:
     from PIL import Image, ImageTk
 
     PIL_AVAILABLE = True
@@ -38,6 +43,20 @@ MODRINTH_SEARCH_URL = "https://api.modrinth.com/v2/search"
 MODRINTH_VERSIONS_URL = "https://api.modrinth.com/v2/project/{project_id}/version"
 MODRINTH_PROJECT_PAGE_URL = "https://modrinth.com/plugin/{project_id}"
 MODRINTH_VERSION_PAGE_URL = "https://modrinth.com/plugin/{project_id}/version/{version_id}"
+
+
+def play_attention_sound(widget: tk.Misc | None = None) -> None:
+    try:
+        if winsound is not None:
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            return
+    except Exception:
+        pass
+    try:
+        if widget is not None:
+            widget.bell()
+    except Exception:
+        pass
 USER_AGENT = "MinecraftPluginAutoUpdateChecker/1.0"
 MODRINTH_PROJECT_URL = "https://api.modrinth.com/v2/project/{project_id}"
 HANGAR_PROJECTS_URL = "https://hangar.papermc.io/api/v1/projects"
@@ -1113,7 +1132,9 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
             "source_type": s_type,
             "source_id": s_id,
             "source_title": s_title,
+            "project_id": rel.get("project_id") if rel else "",
             "matched_version": rel.get("version") if rel else "",
+            "version_id": rel.get("version_id") if rel else "",
             "matched_download_url": rel.get("download_url") if rel else "",
             "reason": reason,
         }
@@ -1295,6 +1316,78 @@ def build_source_url(source_type: str | None, source_id: str | None) -> str:
     if st in {"spiget", "spigot"} and sid:
         return SPIGITMC_PROJECT_PAGE_URL.format(id=sid)
     return ""
+
+
+def build_source_version_url(source_type: str | None, source_id: str | None, version_id: str | None = "", version_name: str | None = "") -> str:
+    """Build a version-specific provider URL when possible; returns an empty string if unsupported."""
+    st = normalize_source_type(source_type)
+    sid = str(source_id or "").strip()
+    vid = str(version_id or "").strip()
+    vname = str(version_name or "").strip()
+    if not sid:
+        return ""
+    if st == "modrinth" and vid:
+        proj = ensure_modrinth_project_id(sid)
+        return MODRINTH_VERSION_PAGE_URL.format(project_id=proj, version_id=vid) if proj else ""
+    if st == "hangar" and vid:
+        ref = extract_hangar_project_ref(sid)
+        if ref:
+            owner, slug = ref.split("/", 1)
+            return HANGAR_VERSION_PAGE_URL.format(owner=owner, slug=slug, version_id=vid)
+        return ""
+    if st == "github" and (vid or vname):
+        ref = extract_github_repo_ref(sid)
+        if ref:
+            owner, repo = ref.split("/", 1)
+            tag = vname or vid
+            if tag:
+                return GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo) + f"/releases/tag/{urllib.parse.quote_plus(tag)}"
+            return GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo)
+        return ""
+    # Spiget does not expose a stable version-specific page; fall back to the resource page.
+    if st in {"spiget", "spigot"} and sid:
+        return SPIGITMC_PROJECT_PAGE_URL.format(id=sid)
+    return ""
+
+
+def open_best_source_page(
+    source_type: str | None,
+    source_id: str | None,
+    version_id: str | None = "",
+    version_name: str | None = "",
+    source_title: str | None = "",
+    *,
+    fallback_query: str | None = "",
+) -> bool:
+    """Open the best available page for a result or source reference.
+
+    Prefers a version-specific page when a version id/name is available.
+    Falls back to the provider page, and finally to a Modrinth search query.
+    Returns True when a browser page was opened.
+    """
+    url = build_source_version_url(source_type, source_id, version_id, version_name)
+    if not url:
+        url = build_source_url(source_type, source_id)
+    if not url and normalize_source_type(source_type) == "spiget" and source_id:
+        try:
+            url = SPIGITMC_PROJECT_PAGE_URL.format(id=source_id)
+        except Exception:
+            url = SPIGET_PROJECT_PAGE_URL.format(id=source_id)
+    if not url and fallback_query:
+        query = urllib.parse.quote_plus(str(fallback_query).strip())
+        if query:
+            url = f"https://modrinth.com/plugins?q={query}"
+    if not url and source_title:
+        query = urllib.parse.quote_plus(str(source_title).strip())
+        if query:
+            url = f"https://modrinth.com/plugins?q={query}"
+    if not url:
+        return False
+    try:
+        webbrowser.open(url)
+        return True
+    except Exception:
+        return False
 
 
 def normalize_source_type(value: str | None) -> str:
@@ -3068,6 +3161,7 @@ class PluginManagerApp(Tk):
             if idx < 0 or idx >= len(server_ids):
                 return
             sid = server_ids[idx]
+            play_attention_sound(self)
             if not messagebox.askyesno("削除確認", "このサーバーを削除しますか?", parent=dialog):
                 return
             try:
@@ -3116,26 +3210,7 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
-        # Center the dialog over the parent window
-        try:
-            dialog.update_idletasks()
-            dw = dialog.winfo_width()
-            dh = dialog.winfo_height()
-            px = self.winfo_rootx()
-            py = self.winfo_rooty()
-            pw = self.winfo_width()
-            ph = self.winfo_height()
-            if pw <= 1 and ph <= 1:
-                sw = self.winfo_screenwidth()
-                sh = self.winfo_screenheight()
-                x = (sw - dw) // 2
-                y = (sh - dh) // 2
-            else:
-                x = px + max(0, (pw - dw) // 2)
-                y = py + max(0, (ph - dh) // 2)
-            dialog.geometry(f"+{x}+{y}")
-        except Exception:
-            pass
+        self._center_modal_dialog(dialog, parent=self.winfo_toplevel())
         # wait until the dialog is closed, then refresh servers in main UI
         try:
             dialog.wait_window()
@@ -3193,6 +3268,45 @@ class PluginManagerApp(Tk):
             messagebox.showinfo("対象なし", "先に一覧のプラグインを1件選択してください。")
         return row
 
+    def _center_modal_dialog(self, dialog: tk.Toplevel, *, parent: tk.Misc | None = None) -> None:
+        """Center a modal dialog over its parent window, or over the screen if needed."""
+        try:
+            dialog.withdraw()
+        except Exception:
+            pass
+
+        try:
+            dialog.update_idletasks()
+            target = parent or self.winfo_toplevel()
+            try:
+                target.update_idletasks()
+            except Exception:
+                pass
+
+            dw = dialog.winfo_width() or dialog.winfo_reqwidth()
+            dh = dialog.winfo_height() or dialog.winfo_reqheight()
+            pw = target.winfo_width()
+            ph = target.winfo_height()
+
+            if pw > 1 and ph > 1:
+                px = target.winfo_rootx()
+                py = target.winfo_rooty()
+                x = px + max(0, (pw - dw) // 2)
+                y = py + max(0, (ph - dh) // 2)
+            else:
+                sw = target.winfo_screenwidth()
+                sh = target.winfo_screenheight()
+                x = max(0, (sw - dw) // 2)
+                y = max(0, (sh - dh) // 2)
+
+            dialog.geometry(f"{max(1, dw)}x{max(1, dh)}+{x}+{y}")
+            dialog.deiconify()
+        except Exception:
+            try:
+                dialog.deiconify()
+            except Exception:
+                pass
+
     def _on_check_compatibility_clicked(self) -> None:
         try:
             sid = int(self.selected_server_id.get() or 0)
@@ -3204,11 +3318,58 @@ class PluginManagerApp(Tk):
 
         default_version, default_software = self._get_server_context()
 
-        target_version = simpledialog.askstring("ターゲットバージョン", "ターゲットのサーバーバージョンを入力してください（例: 1.21.11）", initialvalue=default_version, parent=self)
+        def ask_modal_text(title: str, prompt: str, initialvalue: str = "") -> str | None:
+            dialog = tk.Toplevel(self)
+            dialog.title(title)
+            dialog.transient(self)
+            dialog.grab_set()
+            dialog.resizable(False, False)
+
+            value_var = StringVar(value=initialvalue)
+            result: dict[str, str | None] = {"value": None}
+
+            frame = ttk.Frame(dialog, padding=12)
+            frame.pack(fill=BOTH, expand=True)
+
+            ttk.Label(frame, text=prompt, wraplength=360, justify=LEFT).pack(fill=X, pady=(0, 8))
+            entry = ttk.Entry(frame, textvariable=value_var, width=42)
+            entry.pack(fill=X)
+
+            buttons = ttk.Frame(frame)
+            buttons.pack(fill=X, pady=(12, 0))
+
+            def submit() -> None:
+                result["value"] = value_var.get()
+                dialog.destroy()
+
+            def cancel() -> None:
+                result["value"] = None
+                dialog.destroy()
+
+            ok_btn = ttk.Button(buttons, text="OK", command=submit)
+            ok_btn.pack(side=RIGHT, padx=(6, 0))
+            cancel_btn = ttk.Button(buttons, text="キャンセル", command=cancel)
+            cancel_btn.pack(side=RIGHT)
+
+            dialog.bind("<Return>", lambda event: submit())
+            dialog.bind("<Escape>", lambda event: cancel())
+
+            self._center_modal_dialog(dialog, parent=self.winfo_toplevel())
+            try:
+                dialog.lift()
+                dialog.attributes("-topmost", True)
+                dialog.after(50, lambda: dialog.attributes("-topmost", False))
+            except Exception:
+                pass
+            entry.focus_force()
+            dialog.wait_window()
+            return result["value"]
+
+        target_version = ask_modal_text("ターゲットバージョン", "ターゲットのサーバーバージョンを入力してください（例: 1.21.11）", default_version)
         if target_version is None:
             return
 
-        target_software = simpledialog.askstring("ターゲットソフト", "ターゲットのサーバーソフトを入力してください（例: Paper）", initialvalue=default_software, parent=self)
+        target_software = ask_modal_text("ターゲットソフト", "ターゲットのサーバーソフトを入力してください（例: Paper）", default_software)
         if target_software is None:
             return
 
@@ -3297,6 +3458,11 @@ class PluginManagerApp(Tk):
         vsb.pack(side=RIGHT, fill=Y)
         hsb.pack(side=BOTTOM, fill=X)
 
+        action_frame = ttk.Frame(win)
+        action_frame.pack(fill=X, padx=6, pady=(0, 6))
+
+        result_data_by_iid: dict[str, dict] = {}
+
         all_items: list[tuple[str, dict]] = []
 
         def autosize_columns() -> None:
@@ -3344,7 +3510,9 @@ class PluginManagerApp(Tk):
             matched = res.get("matched_version") or "-"
             url = res.get("matched_download_url") or ""
             reason = res.get("reason") or ""
-            tree.insert("", "end", values=(name, status, src, matched, reason, url))
+            iid = f"result_{len(result_data_by_iid)}"
+            result_data_by_iid[iid] = dict(res)
+            tree.insert("", "end", iid=iid, values=(name, status, src, matched, reason, url))
             try:
                 autosize_columns()
             except Exception:
@@ -3356,18 +3524,41 @@ class PluginManagerApp(Tk):
             except Exception:
                 pass
 
-        def on_double_click(event):
+        def _selected_result_row() -> tuple[str, dict] | None:
             sel = tree.selection()
-            if not sel:
+            iid = sel[0] if sel else tree.focus()
+            if not iid and tree.get_children():
+                iid = tree.get_children()[0]
+            if not iid:
+                return None
+            res = result_data_by_iid.get(iid)
+            if res is None:
+                return None
+            return iid, res
+
+        def open_selected_result() -> None:
+            picked = _selected_result_row()
+            if not picked:
+                messagebox.showinfo("対象なし", "先に結果一覧の項目を1件選択してください。")
                 return
-            vals = tree.item(sel[0]).get("values") or []
-            if len(vals) >= 6 and vals[5]:
-                try:
-                    webbrowser.open(vals[5])
-                except Exception:
-                    pass
+            _, res = picked
+            source_type = res.get("source_type") or ""
+            source_id = res.get("source_id") or res.get("project_id") or ""
+            version_id = res.get("version_id") or ""
+            version_name = res.get("matched_version") or res.get("version") or ""
+            source_title = res.get("source_title") or ""
+            if not open_best_source_page(source_type, source_id, version_id, version_name, source_title):
+                messagebox.showinfo("対象なし", "この結果から開けるページを特定できませんでした。")
+                return
+
+        def on_double_click(event):
+            open_selected_result()
 
         tree.bind('<Double-1>', on_double_click)
+
+        open_source_btn = ttk.Button(action_frame, text="取得元を開く", command=open_selected_result)
+        open_source_btn.pack(side=RIGHT)
+        _attach_tooltip(open_source_btn, "選択中の結果のページを開きます。取得した版の個別ページがあればそちらを優先します。")
 
         # filtering
         def apply_filter():
@@ -3782,6 +3973,7 @@ class PluginManagerApp(Tk):
             add_or_change_url()
 
         tree.bind("<Double-1>", on_double_click)
+        self._center_modal_dialog(dialog, parent=self.winfo_toplevel())
         self.wait_window(dialog)
 
     def _open_homepage_for_row(self, row: sqlite3.Row) -> None:
@@ -3963,6 +4155,7 @@ class PluginManagerApp(Tk):
 
         plugin_name = str(row_get(row, "plugin_name") or "")
         file_path = str(row_get(row, "file_path") or "")
+        play_attention_sound(self)
         if not messagebox.askyesno("削除確認", f"{plugin_name} を一覧から削除しますか?"):
             return
 
@@ -4051,6 +4244,9 @@ class PluginManagerApp(Tk):
         cancel_btn.pack(side=RIGHT, padx=(0, 8))
         _attach_tooltip(apply_btn, "入力したバージョンを選択中プラグインに適用します。")
         _attach_tooltip(cancel_btn, "変更せずに閉じます。")
+        self._center_modal_dialog(dialog, parent=self.winfo_toplevel())
+        version_entry.focus_set()
+        self.wait_window(dialog)
 
     def _open_file_location(self) -> None:
         row = self._selected_row_or_warn()
@@ -4479,6 +4675,8 @@ class PluginManagerApp(Tk):
                 "source_title": resolved_title,
                 "latest_version": current_version,
                 "latest_download_url": "",
+                "version_id": "",
+                "version": current_version,
                 "update_available": 0,
                 "last_checked": now_iso(),
                 "last_error": "",
@@ -4693,6 +4891,12 @@ class PluginManagerApp(Tk):
 
             latest_version = release["version"]
             latest_download_url = release["download_url"]
+            # prefer explicit version id field from provider release
+            version_id = ""
+            try:
+                version_id = release.get("version_id") or release.get("id") or ""
+            except Exception:
+                version_id = ""
             resolved_title = resolved_title or release["title"]
             self._log(f"Resolved: {row_get(row, 'plugin_name')} -> {resolved_source_type}:{resolved_source_id} @ {latest_version}")
 
@@ -4706,6 +4910,8 @@ class PluginManagerApp(Tk):
                 "source_title": resolved_title,
                 "latest_version": latest_version,
                 "latest_download_url": latest_download_url,
+                "version_id": version_id,
+                "version": latest_version,
                 "update_available": update_available,
                 "last_checked": now_iso(),
                 "last_error": "",
@@ -4718,6 +4924,8 @@ class PluginManagerApp(Tk):
                 "source_title": resolved_title,
                 "latest_version": latest_version,
                 "latest_download_url": latest_download_url,
+                "version_id": "",
+                "version": latest_version,
                 "update_available": 0,
                 "last_checked": now_iso(),
                 "last_error": f"{exc}",
@@ -4809,9 +5017,11 @@ class PluginManagerApp(Tk):
 
         if updates_found:
             prompt = f"{len(updates_found)}件の更新が見つかりました。一括ダウンロードしますか?"
+            play_attention_sound(self)
             if messagebox.askyesno("一括ダウンロード", prompt):
                 self.download_updates(updates_found)
         else:
+            play_attention_sound(self)
             messagebox.showinfo("確認完了", "更新は見つかりませんでした。")
 
     def _choose_download_folder(self) -> Path | None:
@@ -4930,6 +5140,11 @@ class PluginManagerApp(Tk):
                 messagebox.showinfo("選択なし", "先に一覧の項目を1つ選択してください。")
                 return
             row = item.get("row")
+            source_type = ""
+            source_id = ""
+            version_id = ""
+            version_name = ""
+            source_title = ""
             # try to resolve to DB row when possible
             if isinstance(row, dict) and "result" in row:
                 result = row_get(row, "result") or {}
@@ -4938,67 +5153,23 @@ class PluginManagerApp(Tk):
                     dbrow = self.database.get_plugin_by_path(file_path)
                 except Exception:
                     dbrow = None
-                if dbrow is not None:
-                    self._open_homepage_for_row(dbrow)
-                    return
-                source_type = row_get(result, "source_type") or ""
-                source_id = row_get(result, "source_id") or ""
-                source_title = row_get(result, "source_title") or ""
-                plugin_name = source_title or file_path or ""
+                source_type = row_get(result, "source_type") or (row_get(dbrow, "source_type") if dbrow else "") or ""
+                source_id = row_get(result, "source_id") or row_get(result, "project_id") or (row_get(dbrow, "source_id") if dbrow else "") or ""
+                version_id = row_get(result, "version_id") or (row_get(dbrow, "latest_version_id") if dbrow else "") or ""
+                version_name = row_get(result, "version") or row_get(result, "matched_version") or (row_get(dbrow, "latest_version") if dbrow else "") or ""
+                source_title = row_get(result, "source_title") or (row_get(dbrow, "source_title") if dbrow else "") or ""
+                plugin_name = (row_get(dbrow, "plugin_name") if dbrow else "") or source_title or file_path or ""
             else:
                 dbrow = row
                 source_type = row_get(dbrow, "source_type")
                 source_id = row_get(dbrow, "source_id")
                 source_title = row_get(dbrow, "source_title")
                 plugin_name = row_get(dbrow, "plugin_name")
+                version_id = row_get(dbrow, "latest_version_id") or ""
+                version_name = row_get(dbrow, "latest_version") or ""
 
             try:
-                # prefer opening a page for the specific version if available
-                if isinstance(row, dict) and "result" in row:
-                    result = row_get(row, "result") or {}
-                    # Modrinth: open version page if we have project_id + version_id
-                    if (result.get("project_id") or source_id) and result.get("version_id") and source_type == "modrinth":
-                        proj = result.get("project_id") or source_id
-                        webbrowser.open(MODRINTH_VERSION_PAGE_URL.format(project_id=proj, version_id=result.get("version_id")))
-                        return
-                    # Hangar: owner/slug and version_id
-                    if result.get("project_id") and result.get("version_id") and source_type == "hangar":
-                        ref = result.get("project_id")
-                        if "/" in ref:
-                            owner, slug = ref.split("/", 1)
-                            webbrowser.open(HANGAR_VERSION_PAGE_URL.format(owner=owner, slug=slug, version_id=result.get("version_id")))
-                            return
-                    # GitHub: open release by tag if version (tag) available
-                    if source_type == "github" and source_id and result.get("version"):
-                        repo_ref = extract_github_repo_ref(source_id)
-                        if repo_ref:
-                            owner, repo = repo_ref.split("/", 1)
-                            tag = str(result.get("version"))
-                            webbrowser.open(GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo) + f"/releases/tag/{urllib.parse.quote_plus(tag)}")
-                            return
-
-                # fallback: open profile/project pages similar to existing behavior
-                if source_type == "github" and source_id:
-                    repo_ref = extract_github_repo_ref(source_id)
-                    if repo_ref:
-                        owner, repo = repo_ref.split("/", 1)
-                        webbrowser.open(GITHUB_PROJECT_PAGE_URL.format(owner=owner, repo=repo))
-                        return
-                if source_type == "spiget" and source_id:
-                    try:
-                        webbrowser.open(SPIGITMC_PROJECT_PAGE_URL.format(id=source_id))
-                        return
-                    except Exception:
-                        try:
-                            webbrowser.open(SPIGET_PROJECT_PAGE_URL.format(id=source_id))
-                            return
-                        except Exception:
-                            pass
-
-                source_title_val = str(source_title or plugin_name or "").strip()
-                query = urllib.parse.quote_plus(source_title_val)
-                if query:
-                    webbrowser.open(f"https://modrinth.com/plugins?q={query}")
+                if open_best_source_page(source_type, source_id, version_id, version_name, source_title, fallback_query=plugin_name):
                     return
             except Exception:
                 pass
@@ -5029,6 +5200,7 @@ class PluginManagerApp(Tk):
         _attach_tooltip(cancel_btn, "ダウンロード選択を取り消して閉じます。")
 
         # wait for the dialog to close
+        self._center_modal_dialog(dialog, parent=self.winfo_toplevel())
         self.wait_window(dialog)
         return result
 
