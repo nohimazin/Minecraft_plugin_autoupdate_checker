@@ -78,21 +78,21 @@ jobs:
             --include-data-files=overrides.json=overrides.json `
             --assume-yes-for-downloads `
             --output-dir=build `
-            --output-filename=${{ env.APP_NAME }} `
+            --output-filename=${{ env.APP_NAME }}.exe `
             app.py
 
       - name: Rename output directory
         shell: pwsh
         run: |
-          Rename-Item `
+          Move-Item `
             "build/app.dist" `
-            "${{ env.APP_NAME }}"
+            "build/${{ env.APP_NAME }}"
 
       - name: Compress package
         shell: pwsh
         run: |
           Compress-Archive `
-            -Path "${{ env.APP_NAME }}" `
+            -Path "build/${{ env.APP_NAME }}" `
             -DestinationPath "${{ env.APP_NAME }}-windows.zip"
 
       - name: Upload artifact
