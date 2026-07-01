@@ -12,7 +12,11 @@
 ```json
 {
   "itemnbtapi": {
-    "preferred_source": "modrinth",
+    "preferred_source": {
+      "type": "modrinth",
+      "id": "nbtapi",
+      "url": "https://modrinth.com/plugin/nbtapi"
+    },
     "spiget_ignore": ["222", "37"],
     "file_paths": ["listing://nbtapi.jar"],
     "file_name_prefixes": ["nbtapi", "item-nbt-api"]
@@ -22,11 +26,11 @@
 
 **フィールド説明**
 
-- `preferred_source` (任意): `modrinth` / `hangar` / `spiget` / `github` / `manual` / `listing` のいずれか。指定された場合、アプリはその提供元を優先して解決を試みます。指定元に互換リリースが存在しない場合、意図しないフォールバックを防ぐために他ソースへ自動でフォールバックしません（結果は「更新なし」として扱われます）。
+- `preferred_source` (任意): `{ "type": "modrinth|hangar|spiget|github|manual|listing", "id": "...", "url": "..." }` 形式のオブジェクトです。`type` で優先提供元を指定し、`id` でその提供元の識別子を保持します。`url` は表示や手動修正時の補助用です。指定された場合、アプリはその提供元を優先して解決を試みます。指定元に互換リリースが存在しない場合、意図しないフォールバックを防ぐために他ソースへ自動でフォールバックしません（結果は「更新なし」として扱われます）。
 
 - `spiget_ignore` (任意): Spigot 側検索結果のうち無視する `id` の配列。文字列または数値で指定可能。Spiget の誤検出を除外するのに有効です。
 
-- `file_paths` (任意): ファイル由来で明示的に紐づけたい場合に使う配列。`listing://` で始まるローカルリスト参照を含められます。例: `"listing://floodgate-spigot.jar"`。
+- `file_paths` (任意): ファイル由来で明示的に紐づけたい場合に使う配列。`listing://` で始まるローカルリスト参照を含められます。例: `"listing://floodgate-spigot.jar"`。アプリは現在この値を辞書照合に使います。
 
 - `file_name_prefixes` (任意): ファイル名や JAR 名の接頭辞リスト。アプリは `file_name_prefixes` のいずれかが一致するかを見て辞書にマッチとみなします。接頭辞マッチは厳密（トークン境界やハイフン区切り等により誤一致を防止）です。
 
@@ -45,7 +49,11 @@
 
 ```json
 "floodgatespigot": {
-  "preferred_source": "hangar",
+  "preferred_source": {
+    "type": "hangar",
+    "id": "GeyserMC/Floodgate",
+    "url": "https://hangar.papermc.io/GeyserMC/Floodgate"
+  },
   "file_name_prefixes": ["floodgate-spigot"],
   "file_paths": ["listing://floodgate-spigot.jar"],
   "spiget_ignore": ["82278"]
@@ -55,4 +63,4 @@
 **フォーマット上の制約**
 
 - JSON であること。
-- 既存のキーと重複する場合、最後に読み込まれたファイルが適用されます（通常はリポジトリ内の `overrides.json` が優先されます）。
+- 現状は `app.py` と同じディレクトリの `overrides.json` 1ファイルのみを読み込みます。複数ファイルのマージや優先順位付けは行いません。

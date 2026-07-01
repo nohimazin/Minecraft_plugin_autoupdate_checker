@@ -101,15 +101,22 @@ def _load_overrides() -> None:
     global OVERRIDES
     try:
         p = Path(__file__).parent / "overrides.json"
-        if p.exists():
-            with p.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                if isinstance(data, dict):
-                    OVERRIDES = data
-                else:
-                    OVERRIDES = {}
-        else:
+        if not p.exists():
             OVERRIDES = {}
+            return
+
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        if not isinstance(data, dict):
+            OVERRIDES = {}
+            return
+
+        cleaned: dict = {}
+        for key, value in data.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                cleaned[key] = value
+        OVERRIDES = cleaned
     except Exception:
         OVERRIDES = {}
 
@@ -457,7 +464,7 @@ def normalize_modrinth_lookup(value: str) -> str:
     return re.sub(r"[^0-9a-z]+", "", (value or "").lower())
 
 
-def http_json(url: str, params: dict[str, object] | None = None) -> dict:
+def http_json(url: str, params: dict[str, object] | None = None) -> dict | list:
     if params:
         query = urllib.parse.urlencode(params, doseq=True)
         url = f"{url}?{query}"
@@ -1102,6 +1109,14 @@ def get_spiget_release(resource_ref: str, server_version: str = "", server_softw
     }
 
 
+def release_has_version_info(release: dict | None) -> bool:
+    if not isinstance(release, dict):
+        return False
+    version = str(release.get("version") or "").strip()
+    version_id = str(release.get("version_id") or release.get("id") or "").strip()
+    return bool(version or version_id)
+
+
 def check_target_compatibility(row_or_name, target_server_version: str, target_server_software: str) -> dict:
     """Check if a plugin (row/dict or name string) has a release compatible with the given target server version/software.
 
@@ -1151,7 +1166,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
                     rel = get_modrinth_release(pid, server_version=target_version, server_software=target_software)
                 except Exception as exc:
                     return build_result(False, "modrinth", pid, s_title, None, f"チェック中に例外が発生 (Modrinth): {exc}")
-                if rel:
+                if release_has_version_info(rel):
                     return build_result(True, "modrinth", pid, s_title, rel)
                 return build_result(False, "modrinth", pid, s_title, None, "互換する Modrinth リリースが見つかりませんでした")
         elif s_type == "hangar":
@@ -1161,7 +1176,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
                     rel = get_hangar_release(ref, server_version=target_version, server_software=target_software)
                 except Exception as exc:
                     return build_result(False, "hangar", ref, s_title, None, f"チェック中に例外が発生 (Hangar): {exc}")
-                if rel:
+                if release_has_version_info(rel):
                     return build_result(True, "hangar", ref, s_title, rel)
                 return build_result(False, "hangar", ref, s_title, None, "互換する Hangar リリースが見つかりませんでした")
         elif s_type == "spiget":
@@ -1171,7 +1186,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
                     rel = get_spiget_release(rid, server_version=target_version, server_software=target_software)
                 except Exception as exc:
                     return build_result(False, "spiget", rid, s_title, None, f"チェック中に例外が発生 (Spiget): {exc}")
-                if rel:
+                if release_has_version_info(rel):
                     return build_result(True, "spiget", rid, s_title, rel)
                 return build_result(False, "spiget", rid, s_title, None, "互換する Spiget リリースが見つかりませんでした")
         elif s_type == "github":
@@ -1181,7 +1196,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
                     rel = get_github_release(repo, server_version=target_version, server_software=target_software)
                 except Exception as exc:
                     return build_result(False, "github", repo, s_title, None, f"チェック中に例外が発生 (GitHub): {exc}")
-                if rel:
+                if release_has_version_info(rel):
                     return build_result(True, "github", repo, s_title, rel)
                 return build_result(False, "github", repo, s_title, None, "互換する GitHub リリースが見つかりませんでした")
 
@@ -1197,7 +1212,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
             rel = get_modrinth_release(pid, server_version=target_version, server_software=target_software)
         except Exception as exc:
             return build_result(False, "modrinth", pid, hit.get("title") or hit.get("slug") or plugin_name, None, f"リリース取得中に例外が発生 (Modrinth): {exc}")
-        if rel:
+        if release_has_version_info(rel):
             return build_result(True, "modrinth", pid, hit.get("title") or hit.get("slug") or plugin_name, rel)
 
     # 2) Hangar
@@ -1211,7 +1226,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
             rel = get_hangar_release(ref, server_version=target_version, server_software=target_software)
         except Exception as exc:
             return build_result(False, "hangar", ref, hit.get("source_title") or plugin_name, None, f"リリース取得中に例外が発生 (Hangar): {exc}")
-        if rel:
+        if release_has_version_info(rel):
             return build_result(True, "hangar", ref, hit.get("source_title") or plugin_name, rel)
 
     # 3) Spiget
@@ -1225,7 +1240,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
             rel = get_spiget_release(rid, server_version=target_version, server_software=target_software)
         except Exception as exc:
             return build_result(False, "spiget", rid, hit.get("source_title") or plugin_name, None, f"リリース取得中に例外が発生 (Spiget): {exc}")
-        if rel:
+        if release_has_version_info(rel):
             return build_result(True, "spiget", rid, hit.get("source_title") or plugin_name, rel)
 
     return build_result(False, "", "", plugin_name, None, "指定ターゲットに適合するリリースが見つかりません")

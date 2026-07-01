@@ -88,7 +88,7 @@ python app.py
 
 現在の実装上の挙動:
 - `preferred_source` と `spiget_ignore` は `search_spiget_project` 側で参照され、該当する場合は Spiget の自動マッチを回避します（`preferred_source` がある場合は Spiget マッチを行わず、その代わり他の提供元を利用する運用を想定しています）。
-- `file_paths` / `file_name_prefixes` は辞書内に保存され、今後の自動割当やインポート時のヒントとして利用される予定です。
+- `file_paths` / `file_name_prefixes` は `_resolve_entry_update()` の辞書照合で使われ、該当するプラグインの取得元決定に反映されます。
 
 運用例:
 - item-nbt-api-plugin のように短いトークンで誤判定を受けやすいプラグインは、`normalized` キー（例: `itemnbtapi` や `nbtapi`）を作り、`preferred_source` に Modrinth の project id と URL を設定しておくと安心です。
