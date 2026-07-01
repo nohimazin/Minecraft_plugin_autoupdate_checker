@@ -1078,6 +1078,7 @@ def get_spiget_release(resource_ref: str, server_version: str = "", server_softw
             "version": "",
             "download_url": SPIGET_DOWNLOAD_URL.format(id=ref, version_id=""),
             "date_published": resource.get("date") or resource.get("createdAt") or "",
+            "tested_versions": resource.get("testedVersions") if isinstance(resource.get("testedVersions"), list) else [],
             "matched_server_version": (server_version or "").strip(),
             "matched_server_software": normalize_server_software(server_software),
         }
@@ -1104,6 +1105,7 @@ def get_spiget_release(resource_ref: str, server_version: str = "", server_softw
         "version_id": version_id,
         "download_url": download_url,
         "date_published": date_published,
+        "tested_versions": resource.get("testedVersions") if isinstance(resource.get("testedVersions"), list) else [],
         "matched_server_version": (server_version or "").strip(),
         "matched_server_software": normalize_server_software(server_software),
     }
@@ -1113,8 +1115,45 @@ def release_has_version_info(release: dict | None) -> bool:
     if not isinstance(release, dict):
         return False
     version = str(release.get("version") or "").strip()
-    version_id = str(release.get("version_id") or release.get("id") or "").strip()
-    return bool(version or version_id)
+    return bool(version)
+
+
+def release_version_missing_reason(source_type: str, target_version: str = "") -> str:
+    label_map = {
+        "modrinth": "Modrinth",
+        "hangar": "Hangar",
+        "spiget": "Spiget",
+        "github": "GitHub",
+    }
+    label = label_map.get((source_type or "").lower(), (source_type or "").strip() or "対象")
+    version_text = (target_version or "").strip()
+    if version_text:
+        return f"{label} で Minecraft {version_text} の対応が確認できませんでした"
+    return f"{label} で対応バージョンを取得できませんでした"
+
+
+def spiget_supports_target_version(release: dict | None, target_version: str) -> bool | None:
+    if not isinstance(release, dict):
+        return None
+
+    versions = release.get("tested_versions")
+    if not isinstance(versions, list):
+        return None
+
+    target = (target_version or "").strip()
+    if not target:
+        return True
+
+    normalized_versions = {str(version).strip() for version in versions if str(version).strip()}
+    if target in normalized_versions:
+        return True
+
+    # Some resources publish broad tested versions like 1.20.6, so allow a direct major.minor match
+    major_minor = ".".join(target.split(".")[:2]) if target.count(".") >= 1 else target
+    if major_minor and major_minor in normalized_versions:
+        return True
+
+    return False
 
 
 def check_target_compatibility(row_or_name, target_server_version: str, target_server_software: str) -> dict:
@@ -1168,7 +1207,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
                     return build_result(False, "modrinth", pid, s_title, None, f"チェック中に例外が発生 (Modrinth): {exc}")
                 if release_has_version_info(rel):
                     return build_result(True, "modrinth", pid, s_title, rel)
-                return build_result(False, "modrinth", pid, s_title, None, "互換する Modrinth リリースが見つかりませんでした")
+                return build_result(False, "modrinth", pid, s_title, None, release_version_missing_reason("modrinth", target_version))
         elif s_type == "hangar":
             ref = extract_hangar_project_ref(s_id)
             if ref:
@@ -1178,7 +1217,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
                     return build_result(False, "hangar", ref, s_title, None, f"チェック中に例外が発生 (Hangar): {exc}")
                 if release_has_version_info(rel):
                     return build_result(True, "hangar", ref, s_title, rel)
-                return build_result(False, "hangar", ref, s_title, None, "互換する Hangar リリースが見つかりませんでした")
+                return build_result(False, "hangar", ref, s_title, None, release_version_missing_reason("hangar", target_version))
         elif s_type == "spiget":
             rid = extract_spiget_resource_id(s_id)
             if rid:
@@ -1187,8 +1226,13 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
                 except Exception as exc:
                     return build_result(False, "spiget", rid, s_title, None, f"チェック中に例外が発生 (Spiget): {exc}")
                 if release_has_version_info(rel):
+                    supported = spiget_supports_target_version(rel, target_version)
+                    if supported is None:
+                        return build_result(False, "spiget", rid, s_title, rel, release_version_missing_reason("spiget", target_version))
+                    if not supported:
+                        return build_result(False, "spiget", rid, s_title, rel, f"Spiget で Minecraft {target_version} の対応が確認できませんでした")
                     return build_result(True, "spiget", rid, s_title, rel)
-                return build_result(False, "spiget", rid, s_title, None, "互換する Spiget リリースが見つかりませんでした")
+                return build_result(False, "spiget", rid, s_title, None, release_version_missing_reason("spiget", target_version))
         elif s_type == "github":
             repo = extract_github_repo_ref(s_id)
             if repo:
@@ -1198,7 +1242,7 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
                     return build_result(False, "github", repo, s_title, None, f"チェック中に例外が発生 (GitHub): {exc}")
                 if release_has_version_info(rel):
                     return build_result(True, "github", repo, s_title, rel)
-                return build_result(False, "github", repo, s_title, None, "互換する GitHub リリースが見つかりませんでした")
+                return build_result(False, "github", repo, s_title, None, release_version_missing_reason("github", target_version))
 
     # Name-based search in preferred order: Modrinth -> Hangar -> Spiget
     # 1) Modrinth
@@ -1241,6 +1285,11 @@ def check_target_compatibility(row_or_name, target_server_version: str, target_s
         except Exception as exc:
             return build_result(False, "spiget", rid, hit.get("source_title") or plugin_name, None, f"リリース取得中に例外が発生 (Spiget): {exc}")
         if release_has_version_info(rel):
+            supported = spiget_supports_target_version(rel, target_version)
+            if supported is None:
+                return build_result(False, "spiget", rid, hit.get("source_title") or plugin_name, rel, release_version_missing_reason("spiget"))
+            if not supported:
+                return build_result(False, "spiget", rid, hit.get("source_title") or plugin_name, rel, f"Spiget で Minecraft {target_version} の対応が確認できませんでした")
             return build_result(True, "spiget", rid, hit.get("source_title") or plugin_name, rel)
 
     return build_result(False, "", "", plugin_name, None, "指定ターゲットに適合するリリースが見つかりません")
