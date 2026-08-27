@@ -1663,6 +1663,17 @@ class PluginDatabase:
         This will initialize the plugins schema in that DB and move any matching rows
         from the master plugins table if present.
         """
+        if int(server_id or 0) <= 0:
+            try:
+                if self.server_connection:
+                    self.server_connection.close()
+            except Exception:
+                pass
+            self.server_connection = None
+            self.server_db_path = None
+            self.current_server_id = 0
+            return
+
         row = None
         try:
             row = self.connection.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
@@ -1717,13 +1728,13 @@ class PluginDatabase:
             master_rows = list(self.connection.execute("SELECT * FROM plugins WHERE server_id = ? OR server_id = 0", (server_id,)).fetchall())
             if master_rows:
                 with conn:
+                    cols = [c[1] for c in self.connection.execute("PRAGMA table_info(plugins)").fetchall()]
                     for r in master_rows:
-                        cols = [c[0] for c in self.connection.execute("PRAGMA table_info(plugins)").fetchall()]
                         values = [r[c] if c in r.keys() else None for c in cols]
                         placeholders = ",".join("?" for _ in cols)
                         conn.execute(f"INSERT OR REPLACE INTO plugins({', '.join(cols)}) VALUES({placeholders})", values)
                 # delete migrated rows from master
-                ids = [str(int(r["id"])) for r in master_rows if r.get("id")]
+                ids = [int(r["id"]) for r in master_rows if "id" in r.keys() and r["id"] is not None]
                 if ids:
                     placeholders = ",".join("?" for _ in ids)
                     with self.connection:
@@ -2343,15 +2354,10 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
-        # selected server id (0 == global)
         try:
-            sel = int(self.database.get_setting("selected_server_id", "0") or "0")
-        except Exception:
-            sel = 0
-        self.selected_server_id = tk.IntVar(value=sel)
-        try:
-            if sel:
-                self.database.open_server_db(sel)
+            selected_server_id = int(self.selected_server_id.get() or 0)
+            if selected_server_id:
+                self.database.open_server_db(selected_server_id)
         except Exception:
             pass
 
@@ -2736,6 +2742,12 @@ class PluginManagerApp(Tk):
                 pass
 
     def _log(self, message: str) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self.task_queue.put(("log_message", str(message)))
+            except Exception:
+                pass
+            return
         self.status_text.set(message)
         self.text.configure(state="normal")
         self.text.insert(END, f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
@@ -2801,6 +2813,7 @@ class PluginManagerApp(Tk):
                         server_version=version,
                         server_software=software,
                         plugin_folder=self.plugin_folder.get() or "",
+                        modrinth_version_channel=self._get_modrinth_version_channel(),
                     )
                 except Exception:
                     pass
@@ -4361,6 +4374,8 @@ class PluginManagerApp(Tk):
             elif task_name == "download_updates_progress":
                 current, total, message = payload
                 self._set_progress(current, total, message)
+            elif task_name == "log_message":
+                self._log(str(payload))
 
         if handled:
             self.update_idletasks()
@@ -4645,7 +4660,13 @@ class PluginManagerApp(Tk):
 
         self._render_db_text(rows)
 
-    def _resolve_entry_update(self, row: sqlite3.Row) -> dict:
+    def _resolve_entry_update(
+        self,
+        row: sqlite3.Row,
+        server_version: str | None = None,
+        server_software: str | None = None,
+        modrinth_version_channel: str | None = None,
+    ) -> dict:
         current_version = row["current_version"] or ""
         source_type = normalize_source_type(row["source_type"])
         source_id = row["source_id"] or ""
@@ -4657,7 +4678,13 @@ class PluginManagerApp(Tk):
         resolved_title = source_title
         resolved_source_id = source_id
         resolved_source_type = source_type or "modrinth"
-        server_version, server_software = self._get_server_context()
+        if server_version is None or server_software is None:
+            server_version, server_software = self._get_server_context()
+        server_version = (server_version or "").strip()
+        server_software = (server_software or "").strip()
+        if modrinth_version_channel is None:
+            modrinth_version_channel = self._get_modrinth_version_channel()
+        modrinth_version_channel = normalize_modrinth_version_channel(modrinth_version_channel)
         try:
             pname = row_get(row, "plugin_name") or ""
             fpath = row_get(row, "file_path") or ""
@@ -4763,7 +4790,7 @@ class PluginManagerApp(Tk):
                     resolved_source_id,
                     server_version=server_version,
                     server_software=server_software,
-                    version_channel=self._get_modrinth_version_channel(),
+                    version_channel=modrinth_version_channel,
                     source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                 )
                 if release:
@@ -4808,7 +4835,7 @@ class PluginManagerApp(Tk):
                     project_id,
                     server_version=server_version,
                     server_software=server_software,
-                    version_channel=self._get_modrinth_version_channel(),
+                    version_channel=modrinth_version_channel,
                     source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                 )
                 if not release:
@@ -4917,7 +4944,7 @@ class PluginManagerApp(Tk):
                             project_id,
                             server_version=server_version,
                             server_software=server_software,
-                            version_channel=self._get_modrinth_version_channel(),
+                            version_channel=modrinth_version_channel,
                             source_title=row_get(row, "plugin_name") or row_get(row, "file_name") or resolved_title or "",
                         )
                     if not release:
@@ -5004,6 +5031,8 @@ class PluginManagerApp(Tk):
         self._set_busy("更新確認中")
         self._set_progress(0, len(rows), f"更新確認中 0 / {len(rows)}")
         row_snapshots = [dict(row) for row in rows]
+        server_version, server_software = self._get_server_context()
+        modrinth_version_channel = self._get_modrinth_version_channel()
 
         def worker() -> None:
             results: list[dict] = []
@@ -5016,7 +5045,16 @@ class PluginManagerApp(Tk):
             except Exception:
                 max_workers = min(8, max(2, (os.cpu_count() or 2) * 2))
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as exe:
-                future_to_row = {exe.submit(self._resolve_entry_update, row): row for row in row_snapshots}
+                future_to_row = {
+                    exe.submit(
+                        self._resolve_entry_update,
+                        row,
+                        server_version,
+                        server_software,
+                        modrinth_version_channel,
+                    ): row
+                    for row in row_snapshots
+                }
                 completed = 0
                 for fut in concurrent.futures.as_completed(future_to_row):
                     row = future_to_row[fut]
@@ -5177,12 +5215,12 @@ class PluginManagerApp(Tk):
         def select_all():
             for iid, data in item_map.items():
                 data["sel"] = True
-                tree.set(iid, "selected", "✓")
+                tree.set(iid, "selected", "☑")
 
         def deselect_all():
             for iid, data in item_map.items():
                 data["sel"] = False
-                tree.set(iid, "selected", "")
+                tree.set(iid, "selected", "☐")
 
         tree.bind("<Button-1>", toggle_item)
 
@@ -5277,12 +5315,19 @@ class PluginManagerApp(Tk):
         self._set_busy("ダウンロード候補を確認中")
         self._set_progress(0, len(rows), f"ダウンロード候補を確認中 0 / {len(rows)}")
         row_snapshots = [dict(row) for row in rows]
+        server_version, server_software = self._get_server_context()
+        modrinth_version_channel = self._get_modrinth_version_channel()
 
         def worker() -> None:
             results: list[dict] = []
             total = len(row_snapshots)
             for index, row in enumerate(row_snapshots, start=1):
-                result = self._resolve_entry_update(row)
+                result = self._resolve_entry_update(
+                    row,
+                    server_version,
+                    server_software,
+                    modrinth_version_channel,
+                )
                 if result.get("update_available"):
                     results.append({"file_path": row["file_path"], "result": result})
                 self.task_queue.put(("download_updates_progress", (index, total, f"ダウンロード候補を確認中 {index} / {total}: {row['plugin_name']}")))
