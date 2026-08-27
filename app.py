@@ -1078,7 +1078,7 @@ def get_spiget_release(resource_ref: str, server_version: str = "", server_softw
             "version": "",
             "download_url": SPIGET_DOWNLOAD_URL.format(id=ref, version_id=""),
             "date_published": resource.get("date") or resource.get("createdAt") or "",
-            "tested_versions": resource.get("testedVersions") if isinstance(resource.get("testedVersions"), list) else [],
+            "tested_versions": (resource.get("testedVersions") if isinstance(resource.get("testedVersions"), list) and resource.get("testedVersions") else None),
             "matched_server_version": (server_version or "").strip(),
             "matched_server_software": normalize_server_software(server_software),
         }
