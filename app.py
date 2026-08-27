@@ -1663,6 +1663,17 @@ class PluginDatabase:
         This will initialize the plugins schema in that DB and move any matching rows
         from the master plugins table if present.
         """
+        if int(server_id or 0) <= 0:
+            try:
+                if self.server_connection:
+                    self.server_connection.close()
+            except Exception:
+                pass
+            self.server_connection = None
+            self.server_db_path = None
+            self.current_server_id = 0
+            return
+
         row = None
         try:
             row = self.connection.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
@@ -2802,6 +2813,7 @@ class PluginManagerApp(Tk):
                         server_version=version,
                         server_software=software,
                         plugin_folder=self.plugin_folder.get() or "",
+                        modrinth_version_channel=self._get_modrinth_version_channel(),
                     )
                 except Exception:
                     pass
