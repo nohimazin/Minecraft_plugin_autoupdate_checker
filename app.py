@@ -1148,7 +1148,7 @@ def spiget_supports_target_version(release: dict | None, target_version: str) ->
     if target in normalized_versions:
         return True
 
-    # Some resources publish broad tested versions like 1.20.6, so allow a direct major.minor match
+    # Some resources publish broad tested versions like 1.20, so allow a direct major.minor match
     major_minor = ".".join(target.split(".")[:2]) if target.count(".") >= 1 else target
     if major_minor and major_minor in normalized_versions:
         return True
