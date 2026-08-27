@@ -2343,15 +2343,10 @@ class PluginManagerApp(Tk):
         except Exception:
             pass
 
-        # selected server id (0 == global)
         try:
-            sel = int(self.database.get_setting("selected_server_id", "0") or "0")
-        except Exception:
-            sel = 0
-        self.selected_server_id = tk.IntVar(value=sel)
-        try:
-            if sel:
-                self.database.open_server_db(sel)
+            selected_server_id = int(self.selected_server_id.get() or 0)
+            if selected_server_id:
+                self.database.open_server_db(selected_server_id)
         except Exception:
             pass
 
@@ -5208,12 +5203,12 @@ class PluginManagerApp(Tk):
         def select_all():
             for iid, data in item_map.items():
                 data["sel"] = True
-                tree.set(iid, "selected", "✓")
+                tree.set(iid, "selected", "☑")
 
         def deselect_all():
             for iid, data in item_map.items():
                 data["sel"] = False
-                tree.set(iid, "selected", "")
+                tree.set(iid, "selected", "☐")
 
         tree.bind("<Button-1>", toggle_item)
 
